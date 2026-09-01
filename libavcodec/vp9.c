@@ -168,6 +168,7 @@ static int update_size(AVCodecContext *avctx, int w, int h)
                      CONFIG_VP9_D3D11VA_HWACCEL * 2 + \
                      CONFIG_VP9_D3D12VA_HWACCEL + \
                      CONFIG_VP9_NVDEC_HWACCEL + \
+                     CONFIG_VP9_V4L2REQUEST_HWACCEL + \
                      CONFIG_VP9_VAAPI_HWACCEL + \
                      CONFIG_VP9_VDPAU_HWACCEL + \
                      CONFIG_VP9_VIDEOTOOLBOX_HWACCEL + \
@@ -210,6 +211,9 @@ static int update_size(AVCodecContext *avctx, int w, int h)
 #endif
 #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
             *fmtp++ = AV_PIX_FMT_VIDEOTOOLBOX;
+#endif
+#if CONFIG_VP9_V4L2REQUEST_HWACCEL
+            *fmtp++ = AV_PIX_FMT_DRM_PRIME;
 #endif
 #if CONFIG_VP9_VULKAN_HWACCEL
             *fmtp++ = AV_PIX_FMT_VULKAN;
@@ -719,7 +723,8 @@ static int decode_frame_header(AVCodecContext *avctx,
                                          get_bits(&s->gb, 8) : 255;
         }
 
-        if (get_bits1(&s->gb)) {
+        s->s.h.segmentation.update_data = get_bits1(&s->gb);
+        if (s->s.h.segmentation.update_data) {
             s->s.h.segmentation.absolute_vals = get_bits1(&s->gb);
             for (i = 0; i < 8; i++) {
                 if ((s->s.h.segmentation.feat[i].q_enabled = get_bits1(&s->gb)))
@@ -736,6 +741,7 @@ static int decode_frame_header(AVCodecContext *avctx,
         // This is necessary because some hwaccels don't ignore these fields
         // if segmentation is disabled.
         s->s.h.segmentation.temporal = 0;
+        s->s.h.segmentation.update_data = 0;
         s->s.h.segmentation.update_map = 0;
     }
 
@@ -1896,6 +1902,7 @@ static int vp9_decode_update_thread_context(AVCodecContext *dst, const AVCodecCo
     s->ss_v = ssrc->ss_v;
     s->ss_h = ssrc->ss_h;
     s->s.h.segmentation.enabled = ssrc->s.h.segmentation.enabled;
+    s->s.h.segmentation.update_data = ssrc->s.h.segmentation.update_data;
     s->s.h.segmentation.update_map = ssrc->s.h.segmentation.update_map;
     s->s.h.segmentation.absolute_vals = ssrc->s.h.segmentation.absolute_vals;
     s->bytesperpixel = ssrc->bytesperpixel;
@@ -1955,6 +1962,9 @@ const FFCodec ff_vp9_decoder = {
 #endif
 #if CONFIG_VP9_VIDEOTOOLBOX_HWACCEL
                                HWACCEL_VIDEOTOOLBOX(vp9),
+#endif
+#if CONFIG_VP9_V4L2REQUEST_HWACCEL
+                               HWACCEL_V4L2REQUEST(vp9),
 #endif
 #if CONFIG_VP9_VULKAN_HWACCEL
                                HWACCEL_VULKAN(vp9),

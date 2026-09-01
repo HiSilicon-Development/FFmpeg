@@ -17,6 +17,7 @@
  */
 
 #include <stdbit.h>
+#include <string.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
@@ -704,7 +705,14 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
     if (pkt && pkt->size == 0)
         return 0;
 
-    if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE)) {
+    /*
+     * Stateful V4L2 M2M uses OUTPUT timestamps to associate decoded CAPTURE
+     * buffers. Keep generated packet timestamps for raw streams: replacing
+     * them with NOPTS collapses every V4L2 timestamp to zero.
+     */
+    if (pkt && (dp->flags & DECODER_FLAG_TS_UNRELIABLE) &&
+        !(dec->codec->wrapper_name &&
+          !strcmp(dec->codec->wrapper_name, "v4l2m2m"))) {
         pkt->pts = AV_NOPTS_VALUE;
         pkt->dts = AV_NOPTS_VALUE;
     }

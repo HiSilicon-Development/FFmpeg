@@ -72,6 +72,7 @@ typedef struct V4L2m2mPriv {
     AVClass *class;
 
     V4L2m2mContext *context;   ///< RefStruct reference
+    AVCodecParserContext *mpeg4_parser;
 
     int num_output_buffers;
     int num_capture_buffers;
