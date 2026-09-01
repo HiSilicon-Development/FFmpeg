@@ -347,6 +347,7 @@ OBJS-$(CONFIG_HISTEQ_FILTER)                 += vf_histeq.o
 OBJS-$(CONFIG_HISTOGRAM_FILTER)              += vf_histogram.o
 OBJS-$(CONFIG_HQDN3D_FILTER)                 += vf_hqdn3d.o
 OBJS-$(CONFIG_HQX_FILTER)                    += vf_hqx.o
+OBJS-$(CONFIG_HIVXEBOB_FILTER)               += vf_hivxebob.o
 OBJS-$(CONFIG_HSTACK_FILTER)                 += vf_stack.o framesync.o
 OBJS-$(CONFIG_HSVHOLD_FILTER)                += vf_hsvkey.o
 OBJS-$(CONFIG_HSVKEY_FILTER)                 += vf_hsvkey.o
