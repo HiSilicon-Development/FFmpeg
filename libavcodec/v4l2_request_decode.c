@@ -181,6 +181,13 @@ static int v4l2_request_wait_on_frame(void *opaque)
         return AVERROR(EINVAL);
 
     ctx = desc->ctx;
+    if (ctx->trace_pipeline &&
+        atomic_fetch_add(&ctx->trace_events, 1) < 48)
+        av_log(ctx, AV_LOG_INFO,
+               "V4L2 Request map-wait capture=%d queued_capture=0x%llx\n",
+               desc->capture.index,
+               (unsigned long long)atomic_load(&ctx->queued_capture));
+
     return ff_v4l2_request_wait_capture(ctx, &desc->capture, true);
 }
 
@@ -382,6 +389,16 @@ static int v4l2_request_queue_decode(AVCodecContext *avctx,
 
     // Mark current request as queued
     atomic_fetch_or(&ctx->queued_request, 1 << pic->output->index);
+
+    if (ctx->trace_pipeline &&
+        atomic_fetch_add(&ctx->trace_events, 1) < 48)
+        av_log(ctx, AV_LOG_INFO,
+               "V4L2 Request queued output=%d capture=%d "
+               "queued_output=0x%x queued_capture=0x%llx\n",
+               pic->output->index, pic->capture->index,
+               atomic_load(&ctx->queued_output),
+               (unsigned long long)atomic_load(
+                   &v4l2_request_capture_context(ctx)->queued_capture));
 
     ret = 0;
 fail:

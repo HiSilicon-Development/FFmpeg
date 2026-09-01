@@ -387,6 +387,7 @@ static int v4l2_request_capture_context_init(V4L2RequestContext *ctx)
         return AVERROR(ENOMEM);
     capture->av_class = &v4l2_request_context_class;
     capture->format = ctx->format;
+    capture->trace_pipeline = ctx->trace_pipeline;
     capture->video_fd = dup(ctx->video_fd);
     if (capture->video_fd < 0 ||
         fcntl(capture->video_fd, F_SETFD, FD_CLOEXEC) < 0) {
@@ -400,6 +401,7 @@ static int v4l2_request_capture_context_init(V4L2RequestContext *ctx)
     ff_mutex_init(&capture->mutex, NULL);
     atomic_init(&capture->queued_capture, 0);
     atomic_init(&capture->capture_errors, 0);
+    atomic_init(&capture->trace_events, 0);
     ctx->capture_ref = av_buffer_create((uint8_t *)capture, sizeof(*capture),
                                        v4l2_request_capture_context_free, NULL, 0);
     if (!ctx->capture_ref) {
@@ -526,10 +528,20 @@ static int v4l2_request_init_context(AVCodecContext *avctx)
     atomic_init(&ctx->queued_request, 0);
     atomic_init(&ctx->queued_capture, 0);
     atomic_init(&ctx->capture_errors, 0);
+    atomic_init(&ctx->trace_events, 0);
     ctx->defer_capture_wait =
         getenv("HISTB_V4L2REQUEST_DEFER_CAPTURE_WAIT") != NULL;
     ctx->defer_capture_wait_auto = ctx->defer_capture_wait &&
         !strcmp(getenv("HISTB_V4L2REQUEST_DEFER_CAPTURE_WAIT"), "auto");
+    ctx->trace_pipeline =
+        getenv("HISTB_V4L2REQUEST_TRACE_PIPELINE") != NULL;
+
+    if (ctx->trace_pipeline)
+        av_log(ctx, AV_LOG_INFO,
+               "V4L2 Request pipeline trace: threads=%d active_thread_type=0x%x "
+               "defer_capture_wait=%d\n",
+               avctx->thread_count, avctx->active_thread_type,
+               ctx->defer_capture_wait);
 
     // Get format details for capture buffers
     if (ioctl(ctx->video_fd, VIDIOC_G_FMT, &ctx->format) < 0) {
