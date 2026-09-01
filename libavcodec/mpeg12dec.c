@@ -794,6 +794,9 @@ static const enum AVPixelFormat mpeg1_hwaccel_pixfmt_list_420[] = {
 #if CONFIG_MPEG1_VDPAU_HWACCEL
     AV_PIX_FMT_VDPAU,
 #endif
+#if CONFIG_MPEG1_V4L2REQUEST_HWACCEL
+    AV_PIX_FMT_DRM_PRIME,
+#endif
     AV_PIX_FMT_YUV420P,
     AV_PIX_FMT_NONE
 };
@@ -2656,6 +2659,9 @@ const FFCodec ff_mpeg1video_decoder = {
 #endif
 #if CONFIG_MPEG1_VIDEOTOOLBOX_HWACCEL
                                HWACCEL_VIDEOTOOLBOX(mpeg1),
+#endif
+#if CONFIG_MPEG1_V4L2REQUEST_HWACCEL
+                               HWACCEL_V4L2REQUEST(mpeg1),
 #endif
                                NULL
                            },
