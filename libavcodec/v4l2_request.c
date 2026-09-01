@@ -263,6 +263,7 @@ int ff_v4l2_request_frame_params(AVCodecContext *avctx,
 {
     V4L2RequestContext *ctx = v4l2_request_context(avctx);
     AVHWFramesContext *hwfc = (AVHWFramesContext *)hw_frames_ctx->data;
+    AVV4L2RequestFramesContext *frames = hwfc->hwctx;
 
     hwfc->format = AV_PIX_FMT_DRM_PRIME;
     hwfc->sw_format = ff_v4l2_request_get_sw_format(&ctx->format);
@@ -270,9 +271,11 @@ int ff_v4l2_request_frame_params(AVCodecContext *avctx,
     if (V4L2_TYPE_IS_MULTIPLANAR(ctx->format.type)) {
         hwfc->width = ctx->format.fmt.pix_mp.width;
         hwfc->height = ctx->format.fmt.pix_mp.height;
+        frames->bytesperline = ctx->format.fmt.pix_mp.plane_fmt[0].bytesperline;
     } else {
         hwfc->width = ctx->format.fmt.pix.width;
         hwfc->height = ctx->format.fmt.pix.height;
+        frames->bytesperline = ctx->format.fmt.pix.bytesperline;
     }
 
     hwfc->pool = av_buffer_pool_init2(sizeof(V4L2RequestFrameDescriptor), ctx,

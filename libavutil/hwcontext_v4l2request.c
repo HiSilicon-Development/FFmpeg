@@ -246,6 +246,7 @@ const HWContextType ff_hwcontext_type_v4l2request = {
     .name                   = "V4L2 Request API",
 
     .device_hwctx_size      = sizeof(AVV4L2RequestDeviceContext),
+    .frames_hwctx_size      = sizeof(AVV4L2RequestFramesContext),
     .device_create          = v4l2request_device_create,
     .device_init            = v4l2request_device_init,
 

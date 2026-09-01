@@ -38,4 +38,12 @@ typedef struct AVV4L2RequestDeviceContext {
     int media_fd;
 } AVV4L2RequestDeviceContext;
 
+/**
+ * V4L2 Request capture layout, allocated as AVHWFramesContext.hwctx.
+ * The negotiated row pitch is independent of the visible frame width.
+ */
+typedef struct AVV4L2RequestFramesContext {
+    int bytesperline;
+} AVV4L2RequestFramesContext;
+
 #endif /* AVUTIL_HWCONTEXT_V4L2REQUEST_H */
