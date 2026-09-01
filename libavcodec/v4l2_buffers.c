@@ -612,24 +612,39 @@ int ff_v4l2_buffer_buf_to_avpkt(AVPacket *pkt, V4L2Buffer *avbuf)
     int ret;
 
     av_packet_unref(pkt);
-    ret = v4l2_buf_to_bufref(avbuf, 0, &pkt->buf);
-    if (ret)
-        return ret;
-
-    pkt->size = V4L2_TYPE_IS_MULTIPLANAR(avbuf->buf.type) ? avbuf->buf.m.planes[0].bytesused : avbuf->buf.bytesused;
-    pkt->data = pkt->buf->data;
-
-    if (avbuf->buf.flags & V4L2_BUF_FLAG_KEYFRAME)
-        pkt->flags |= AV_PKT_FLAG_KEY;
-
-    if (avbuf->buf.flags & V4L2_BUF_FLAG_ERROR) {
-        av_log(logger(avbuf), AV_LOG_ERROR, "%s driver encode error\n", avbuf->context->name);
-        pkt->flags |= AV_PKT_FLAG_CORRUPT;
+    if (offset > bytesused ||
+        bytesused > avbuf->plane_info[0].length) {
+        ret = AVERROR_INVALIDDATA;
+        goto done;
     }
 
+    /*
+     * A muxer can retain packets longer than this finite CAPTURE queue.
+     * Own the compressed payload and promptly recycle its DMA buffer;
+     * raw pixel DMA-BUF ownership is unchanged.
+     */
+    ret = av_new_packet(pkt, bytesused - offset);
+    if (ret < 0)
+        goto done;
+    memcpy(pkt->data, data + offset, pkt->size);
+    if (avbuf->buf.flags & V4L2_BUF_FLAG_KEYFRAME)
+        pkt->flags |= AV_PKT_FLAG_KEY;
+    if (avbuf->buf.flags & V4L2_BUF_FLAG_ERROR) {
+        av_log(logger(avbuf), AV_LOG_ERROR, "%s driver encode error\n",
+               avbuf->context->name);
+        pkt->flags |= AV_PKT_FLAG_CORRUPT;
+    }
     pkt->dts = pkt->pts = v4l2_get_pts(avbuf);
+done:
+    if (avbuf->context->streamon && !avbuf->context->done) {
+        int queued = ff_v4l2_buffer_enqueue(avbuf);
 
-    return 0;
+        if (!ret && queued < 0) {
+            av_packet_unref(pkt);
+            ret = queued;
+        }
+    }
+    return ret;
 }
 
 int ff_v4l2_buffer_avpkt_to_buf(const AVPacket *pkt, V4L2Buffer *out)
@@ -724,6 +739,10 @@ int ff_v4l2_buffer_initialize(V4L2Buffer* avbuf, int index)
 
 int ff_v4l2_buffer_enqueue(V4L2Buffer* avbuf)
 {
+    const uint8_t *data = avbuf->plane_info[0].mm_addr;
+    unsigned int bytesused = V4L2_TYPE_IS_MULTIPLANAR(avbuf->buf.type) ?
+                             avbuf->planes[0].bytesused : avbuf->buf.bytesused;
+    unsigned int offset = avbuf->planes[0].data_offset;
     int ret;
 
     avbuf->buf.flags = avbuf->flags;
