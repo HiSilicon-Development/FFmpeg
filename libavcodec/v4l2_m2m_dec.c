@@ -191,6 +191,41 @@ static int v4l2_wmv3_queue_sequence(AVCodecContext *avctx,
     return 0;
 }
 
+/*
+ * The driver parses MPEG-4 itself: histb-vdec-mpeg4.c looks for the visual
+ * object sequence and the VOL before it will accept a VOP, and returns
+ * HISTB_MPEG4_INVALID if the first access unit carries neither.  The packets on
+ * this path start at the VOP, so the headers have to be sent ahead of them, the
+ * same way the WMV3 sequence header is.  avctx->extradata holds them in Annex B
+ * form - VOS, VOS_END, VOL, USER_DATA - which is what the parser reads.
+ */
+static int v4l2_mpeg4_queue_headers(AVCodecContext *avctx,
+                                    V4L2m2mPriv *priv,
+                                    V4L2Context *output)
+{
+    AVPacket headers = { 0 };
+    int ret;
+
+    if (avctx->codec_id != AV_CODEC_ID_MPEG4 || priv->mpeg4_headers_queued)
+        return 0;
+    if (!avctx->extradata || !avctx->extradata_size) {
+        av_log(avctx, AV_LOG_ERROR,
+               "MPEG4 V4L2 requires the visual object sequence and VOL in extradata\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    headers.data = avctx->extradata;
+    headers.size = avctx->extradata_size;
+    headers.pts = AV_NOPTS_VALUE;
+    headers.dts = AV_NOPTS_VALUE;
+    ret = ff_v4l2_context_enqueue_packet(output, &headers);
+    if (ret < 0)
+        return ret;
+
+    priv->mpeg4_headers_queued = 1;
+    return 0;
+}
+
 static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     V4L2m2mPriv *priv = avctx->priv_data;
@@ -200,6 +235,10 @@ static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     int ret;
 
     ret = v4l2_wmv3_queue_sequence(avctx, priv, output);
+    if (ret < 0)
+        return ret;
+
+    ret = v4l2_mpeg4_queue_headers(avctx, priv, output);
     if (ret < 0)
         return ret;
 
