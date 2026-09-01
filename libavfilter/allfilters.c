@@ -321,6 +321,7 @@ extern const FFFilter ff_vf_histeq;
 extern const FFFilter ff_vf_histogram;
 extern const FFFilter ff_vf_hqdn3d;
 extern const FFFilter ff_vf_hivxebob;
+extern const FFFilter ff_vf_hivxedei;
 extern const FFFilter ff_vf_hqx;
 extern const FFFilter ff_vf_hstack;
 extern const FFFilter ff_vf_hsvhold;

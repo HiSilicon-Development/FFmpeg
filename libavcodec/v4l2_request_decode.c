@@ -487,6 +487,8 @@ int ff_v4l2_request_start_frame(AVCodecContext *avctx,
     V4L2RequestContext *ctx = v4l2_request_context(avctx);
     V4L2RequestFrameDescriptor *desc = v4l2_request_framedesc(frame);
     FrameDecodeData *fdd = frame->private_ref;
+    AVHWFramesContext *hwfc = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+    AVV4L2RequestFramesContext *frames = hwfc->hwctx;
     int ret;
 
     // Get next output buffer from circular queue
@@ -508,6 +510,11 @@ int ff_v4l2_request_start_frame(AVCodecContext *avctx,
     desc->ctx = v4l2_request_capture_context(ctx);
     desc->base.wait = v4l2_request_wait_on_frame;
     desc->base.wait_opaque = desc;
+
+    /* Publish parsed syntax timing once, before any frame reaches filters. */
+    if (frames->frame_rate.num <= 0 && avctx->framerate.num > 0 &&
+        avctx->framerate.den > 0)
+        frames->frame_rate = avctx->framerate;
 
     // Capture buffer used for current frame
     pic->capture = &desc->capture;

@@ -20,11 +20,14 @@
 #define AVUTIL_HWCONTEXT_V4L2REQUEST_H
 
 #include "hwcontext_drm.h"
+#include "rational.h"
 
 /**
  * @file
  * An API-specific header for AV_HWDEVICE_TYPE_V4L2REQUEST.
  */
+
+struct AVFrame;
 
 /**
  * V4L2 Request API device details.
@@ -46,6 +49,8 @@ typedef struct AVV4L2RequestDeviceContext {
  */
 typedef struct AVV4L2RequestFramesContext {
     int bytesperline;
+    /** Coded picture cadence from codec syntax, not a demux packet guess. */
+    AVRational frame_rate;
 } AVV4L2RequestFramesContext;
 
 /**
@@ -59,6 +64,14 @@ typedef struct AVV4L2RequestFrameDescriptor {
     AVDRMFrameDescriptor drm;
     int (*wait)(void *opaque);
     void *wait_opaque;
+    /**
+     * Optional synchronous hardware DEI after codec display reordering.
+     * Inputs are retained woven NV12 frames. Output owns a separate pair
+     * of progressive NV12 surfaces; no CPU pixel copy.
+     */
+    int (*deinterlace)(const struct AVFrame *previous,
+                       const struct AVFrame *current,
+                       const struct AVFrame *next, struct AVFrame *output[2]);
 } AVV4L2RequestFrameDescriptor;
 
 #endif /* AVUTIL_HWCONTEXT_V4L2REQUEST_H */

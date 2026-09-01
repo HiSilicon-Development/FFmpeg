@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/ioctl.h>
+#include <linux/histb-vpss.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -220,6 +221,10 @@ static void v4l2_request_frame_free(void *opaque, uint8_t *data)
     av_free(data);
 }
 
+static int v4l2_request_deinterlace(const AVFrame *previous,
+                                    const AVFrame *current,
+                                    const AVFrame *next, AVFrame *output[2]);
+
 static AVBufferRef *v4l2_request_frame_alloc(void *opaque, size_t size)
 {
     V4L2RequestContext *ctx = opaque;
@@ -254,6 +259,8 @@ static AVBufferRef *v4l2_request_frame_alloc(void *opaque, size_t size)
             return NULL;
         }
         desc->ctx = (void *)desc->capture_ref->data;
+        if (ff_v4l2_request_get_sw_format(&ctx->format) == AV_PIX_FMT_NV12)
+            desc->base.deinterlace = v4l2_request_deinterlace;
     }
 
     // Set AVDRMFrameDescriptor of this AVFrame
@@ -265,6 +272,99 @@ static AVBufferRef *v4l2_request_frame_alloc(void *opaque, size_t size)
     return ref;
 }
 
+
+static int v4l2_request_deinterlace(const AVFrame *previous,
+                                    const AVFrame *current,
+                                    const AVFrame *next, AVFrame *output[2])
+{
+    V4L2RequestFrameDescriptor *cur = (void *)current->data[0];
+    V4L2RequestFrameDescriptor *prev = (void *)previous->data[0];
+    V4L2RequestFrameDescriptor *nxt = (void *)next->data[0];
+    V4L2RequestFrameDescriptor *dst;
+    V4L2RequestContext *ctx = cur->capture_ref ? (void *)cur->capture_ref->data : NULL;
+    const int tff = !!(current->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST);
+    const int prev_tff = !!(previous->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST);
+    const int next_tff = !!(next->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST);
+    struct histb_vpss_dei_request job = {
+        .flags = tff ? HISTB_VPSS_DEI_TOP_FIELD_FIRST : 0,
+    };
+    int ret = 0;
+
+    if (!ctx || !prev->capture_ref || !nxt->capture_ref ||
+        prev->capture_ref->data != cur->capture_ref->data ||
+        nxt->capture_ref->data != cur->capture_ref->data)
+        return AVERROR(EINVAL);
+
+    ret = ff_v4l2_request_wait_capture(ctx, &cur->capture, true);
+    if (ret < 0)
+        return ret;
+    if (previous != current) {
+        ret = ff_v4l2_request_wait_capture(ctx, &prev->capture, true);
+        if (ret < 0)
+            return ret;
+    }
+    if (next != current && next != previous) {
+        ret = ff_v4l2_request_wait_capture(ctx, &nxt->capture, true);
+        if (ret < 0)
+            return ret;
+    }
+
+    ff_mutex_lock(&ctx->mutex);
+    if (!ctx->dei_pool)
+        ctx->dei_pool = av_buffer_pool_init2(sizeof(*dst), ctx,
+                                              v4l2_request_frame_alloc, NULL);
+    for (int image = 0; image < 2; image++) {
+        unsigned int bottom[4];
+
+        if (!ctx->dei_pool ||
+            !(output[image]->buf[0] = av_buffer_pool_get(ctx->dei_pool))) {
+            ret = AVERROR(ENOMEM);
+            goto done;
+        }
+        dst = (void *)output[image]->buf[0]->data;
+        output[image]->data[0] = output[image]->buf[0]->data;
+        output[image]->hw_frames_ctx = av_buffer_ref(current->hw_frames_ctx);
+        if (!output[image]->hw_frames_ctx) {
+            ret = AVERROR(ENOMEM);
+            goto done;
+        }
+        output[image]->format = AV_PIX_FMT_DRM_PRIME;
+        output[image]->width = current->width;
+        output[image]->height = current->height;
+        job.destination = dst->capture.index;
+
+        if (!image) {
+            job.source[0] = prev->capture.index;
+            job.source[1] = job.source[2] = cur->capture.index;
+            job.source[3] = nxt->capture.index;
+            bottom[0] = previous == current ? !tff : prev_tff;
+            bottom[1] = !tff;
+            bottom[2] = tff;
+            bottom[3] = next == current ? tff : !next_tff;
+        } else {
+            job.source[0] = job.source[1] = cur->capture.index;
+            job.source[2] = job.source[3] = nxt->capture.index;
+            bottom[0] = !tff;
+            bottom[1] = tff;
+            bottom[2] = next == current ? tff : !next_tff;
+            bottom[3] = next_tff;
+        }
+        job.bottom_mask = bottom[0] | bottom[1] << 1 |
+                          bottom[2] << 2 | bottom[3] << 3;
+        if (ioctl(ctx->video_fd, VIDIOC_HISTB_VPSS_DEI, &job) < 0) {
+            ret = AVERROR(errno);
+            goto done;
+        }
+    }
+done:
+    ff_mutex_unlock(&ctx->mutex);
+    if (ret < 0) {
+        av_frame_unref(output[0]);
+        av_frame_unref(output[1]);
+    }
+    return ret;
+}
+
 /*
  * Filters can still own reordered frames after the codec has reached EOF.
  * A separate fd/allocator outlives codec-private state through capture refs.
@@ -273,6 +373,7 @@ static void v4l2_request_capture_context_free(void *opaque, uint8_t *data)
 {
     V4L2RequestContext *ctx = (void *)data;
 
+    av_buffer_pool_uninit(&ctx->dei_pool);
     close(ctx->video_fd);
     ff_mutex_destroy(&ctx->mutex);
     av_free(ctx);

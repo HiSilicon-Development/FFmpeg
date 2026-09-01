@@ -53,6 +53,7 @@ typedef struct V4L2RequestContext {
     atomic_uint_least32_t queued_request;
     atomic_uint_least64_t queued_capture;
     atomic_uint_least64_t capture_errors;
+    AVBufferPool *dei_pool;
     AVBufferRef *capture_ref;
     int (*post_probe)(AVCodecContext *avctx);
     bool defer_capture_wait;

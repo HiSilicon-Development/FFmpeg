@@ -2402,6 +2402,11 @@ static int choose_out_timebase(OutputFilterPriv *ofp, AVFrame *frame)
         if (fr_sink.num > 0 && fr_sink.den > 0)
             fr = fr_sink;
     }
+    /* A filter may determine its cadence from the first decoded frame,
+     * after downstream links have already been configured. */
+    if (!fr.num && frame->duration > 0)
+        fr = av_inv_q(av_mul_q(frame->time_base,
+                              (AVRational) { frame->duration, 1 }));
 
     if (fps->vsync_method == VSYNC_CFR || fps->vsync_method == VSYNC_VSCFR) {
         if (!fr.num && !fps->framerate_max.num) {
