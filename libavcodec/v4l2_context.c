@@ -49,6 +49,11 @@ static inline V4L2m2mContext *ctx_to_m2mctx(V4L2Context *ctx)
         container_of(ctx, V4L2m2mContext, capture);
 }
 
+static enum v4l2_memory v4l2_context_memory(const V4L2Context *ctx)
+{
+    return ctx->memory ? ctx->memory : V4L2_MEMORY_MMAP;
+}
+
 static inline AVCodecContext *logger(V4L2Context *ctx)
 {
     return ctx_to_m2mctx(ctx)->avctx;
@@ -377,7 +382,7 @@ start:
 
 dequeue:
         memset(&buf, 0, sizeof(buf));
-        buf.memory = V4L2_MEMORY_MMAP;
+        buf.memory = v4l2_context_memory(ctx);
         buf.type = ctx->type;
         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
             memset(planes, 0, sizeof(planes));
@@ -410,6 +415,7 @@ dequeue:
         }
 
         avbuf = &ctx->buffers[buf.index];
+        av_frame_free(&avbuf->imported_frame);
         avbuf->status = V4L2BUF_AVAILABLE;
         avbuf->buf = buf;
         if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
@@ -444,7 +450,7 @@ static V4L2Buffer* v4l2_getfree_v4l2buf(V4L2Context *ctx)
 static int v4l2_release_buffers(V4L2Context* ctx)
 {
     struct v4l2_requestbuffers req = {
-        .memory = V4L2_MEMORY_MMAP,
+        .memory = v4l2_context_memory(ctx),
         .type = ctx->type,
         .count = 0, /* 0 -> unmaps buffers from the driver */
     };
@@ -452,6 +458,8 @@ static int v4l2_release_buffers(V4L2Context* ctx)
 
     for (i = 0; i < ctx->num_buffers; i++) {
         V4L2Buffer *buffer = &ctx->buffers[i];
+
+        av_frame_free(&buffer->imported_frame);
 
         for (j = 0; j < buffer->num_planes; j++) {
             struct V4L2Plane_info *p = &buffer->plane_info[j];
@@ -471,13 +479,25 @@ static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfm
     int ret;
 
     v4l2_fmt = ff_v4l2_format_avfmt_to_v4l2(pixfmt);
+#ifdef V4L2_PIX_FMT_NV12M
+    if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type) &&
+        pixfmt == AV_PIX_FMT_NV12)
+        v4l2_fmt = V4L2_PIX_FMT_NV12M;
+#endif
     if (!v4l2_fmt)
         return AVERROR(EINVAL);
 
-    if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type))
+    if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
         fmt->fmt.pix_mp.pixelformat = v4l2_fmt;
-    else
+        if (ctx->bytesperline && pixfmt == AV_PIX_FMT_NV12) {
+            fmt->fmt.pix_mp.plane_fmt[0].bytesperline = ctx->bytesperline;
+            fmt->fmt.pix_mp.plane_fmt[1].bytesperline = ctx->bytesperline;
+        }
+    } else {
         fmt->fmt.pix.pixelformat = v4l2_fmt;
+        if (ctx->bytesperline)
+            fmt->fmt.pix.bytesperline = ctx->bytesperline;
+    }
 
     fmt->type = ctx->type;
 
@@ -729,7 +749,7 @@ int ff_v4l2_context_init(V4L2Context* ctx)
 
     memset(&req, 0, sizeof(req));
     req.count = ctx->num_buffers;
-    req.memory = V4L2_MEMORY_MMAP;
+    req.memory = v4l2_context_memory(ctx);
     req.type = ctx->type;
     ret = ioctl(s->fd, VIDIOC_REQBUFS, &req);
     if (ret < 0) {

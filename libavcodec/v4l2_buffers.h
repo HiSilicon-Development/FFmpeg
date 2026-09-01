@@ -66,6 +66,9 @@ typedef struct V4L2Buffer {
     int flags;
     enum V4L2Buffer_status status;
 
+    /* Keep an imported DMABUF frame alive until the driver dequeues it. */
+    AVFrame *imported_frame;
+
 } V4L2Buffer;
 
 /**

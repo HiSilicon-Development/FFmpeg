@@ -29,8 +29,10 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/opt.h"
+#include "libavutil/hwcontext_v4l2request.h"
 #include "codec_internal.h"
 #include "profiles.h"
+#include "hwconfig.h"
 #include "v4l2_context.h"
 #include "v4l2_m2m.h"
 #include "v4l2_fmt.h"
@@ -178,6 +180,38 @@ static inline void v4l2_subscribe_eos_event(V4L2m2mContext *s)
                "the v4l2 driver does not support end of stream VIDIOC_SUBSCRIBE_EVENT\n");
 }
 
+static int v4l2_set_sar(V4L2m2mContext *s)
+{
+    AVRational sar = s->avctx->sample_aspect_ratio;
+    struct v4l2_queryctrl query = { .id = MPEG_CID(H264_VUI_SAR_ENABLE) };
+    struct v4l2_ext_control controls[4] = {
+        { .id = MPEG_CID(H264_VUI_EXT_SAR_WIDTH) },
+        { .id = MPEG_CID(H264_VUI_EXT_SAR_HEIGHT) },
+        { .id = MPEG_CID(H264_VUI_SAR_IDC),
+          .value = MPEG_VIDEO(H264_VUI_SAR_IDC_EXTENDED) },
+        { .id = MPEG_CID(H264_VUI_SAR_ENABLE), .value = 1 },
+    };
+    struct v4l2_ext_controls ctrls = {
+        .ctrl_class = V4L2_CTRL_CLASS_MPEG,
+        .count = FF_ARRAY_ELEMS(controls),
+        .controls = controls,
+    };
+
+    if (sar.num <= 0 || sar.den <= 0)
+        return 0;
+    if (ioctl(s->fd, VIDIOC_QUERYCTRL, &query) < 0) {
+        if (errno == EINVAL)
+            return 0;
+        return AVERROR(errno);
+    }
+    av_reduce(&sar.num, &sar.den, sar.num, sar.den, UINT16_MAX);
+    controls[0].value = sar.num;
+    controls[1].value = sar.den;
+    if (ioctl(s->fd, VIDIOC_S_EXT_CTRLS, &ctrls) < 0)
+        return AVERROR(errno);
+    return 0;
+}
+
 static int v4l2_prepare_encoder(V4L2m2mContext *s)
 {
     AVCodecContext *avctx = s->avctx;
@@ -199,6 +233,11 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
     if (avctx->framerate.num || avctx->framerate.den) {
         ret = v4l2_set_timeperframe(s, avctx->framerate.den,
                                     avctx->framerate.num);
+        if (ret < 0)
+            return ret;
+    }
+    if (avctx->codec_id == AV_CODEC_ID_H264) {
+        ret = v4l2_set_sar(s);
         if (ret < 0)
             return ret;
     }
@@ -364,7 +403,24 @@ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
 
     /* output context */
     output->av_codec_id = AV_CODEC_ID_RAWVIDEO;
-    output->av_pix_fmt = avctx->pix_fmt;
+    if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
+        AVHWFramesContext *frames;
+
+        if (!avctx->hw_frames_ctx)
+            return AVERROR(EINVAL);
+        frames = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
+        if (frames->sw_format != AV_PIX_FMT_NV12)
+            return AVERROR(EINVAL);
+        output->av_pix_fmt = frames->sw_format;
+        output->memory = V4L2_MEMORY_DMABUF;
+        if (frames->device_ctx->type == AV_HWDEVICE_TYPE_V4L2REQUEST) {
+            const AVV4L2RequestFramesContext *request = frames->hwctx;
+
+            output->bytesperline = request->bytesperline;
+        }
+    } else {
+        output->av_pix_fmt = avctx->pix_fmt;
+    }
 
     /* capture context */
     capture->av_codec_id = avctx->codec_id;
@@ -383,7 +439,7 @@ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
         v4l2_fmt_output = output->format.fmt.pix.pixelformat;
 
     pix_fmt_output = ff_v4l2_format_v4l2_to_avfmt(v4l2_fmt_output, AV_CODEC_ID_RAWVIDEO);
-    if (pix_fmt_output != avctx->pix_fmt) {
+    if (pix_fmt_output != output->av_pix_fmt) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt_output);
         av_log(avctx, AV_LOG_ERROR, "Encoder requires %s pixel format.\n", desc->name);
         return AVERROR(EINVAL);
@@ -422,6 +478,13 @@ static const FFCodecDefault v4l2_m2m_defaults[] = {
     { NULL },
 };
 
+
+static const AVCodecHWConfigInternal *const v4l2_m2m_hw_configs[] = {
+    HW_CONFIG_ENCODER_FRAMES(DRM_PRIME, V4L2REQUEST),
+    HW_CONFIG_ENCODER_FRAMES(DRM_PRIME, DRM),
+    NULL,
+};
+
 #define M2MENC_CLASS(NAME, OPTIONS_NAME) \
     static const AVClass v4l2_m2m_ ## NAME ## _enc_class = { \
         .class_name = #NAME "_v4l2m2m_encoder", \
@@ -448,6 +511,7 @@ static const FFCodecDefault v4l2_m2m_defaults[] = {
         .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
                           FF_CODEC_CAP_INIT_CLEANUP, \
         .p.wrapper_name = "v4l2m2m", \
+        .hw_configs     = v4l2_m2m_hw_configs, \
     }
 
 M2MENC(mpeg4,"MPEG4", mpeg4_options, AV_CODEC_ID_MPEG4);

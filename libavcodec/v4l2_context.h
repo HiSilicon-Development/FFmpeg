@@ -48,6 +48,15 @@ typedef struct V4L2Context {
     enum v4l2_buf_type type;
 
     /**
+     * Memory model used for this queue. Zero selects the traditional MMAP
+     * path; encoders may select DMABUF for DRM PRIME input frames.
+     */
+    enum v4l2_memory memory;
+
+    /** Requested DMA row pitch; zero lets the driver choose its layout. */
+    int bytesperline;
+
+    /**
      * AVPixelFormat corresponding to this buffer context.
      * AV_PIX_FMT_NONE means this is an encoded stream.
      */

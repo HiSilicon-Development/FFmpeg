@@ -22,6 +22,7 @@
  */
 
 #include <linux/videodev2.h>
+#include <stdbool.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -29,6 +30,10 @@
 #include <poll.h>
 #include "libavcodec/avcodec.h"
 #include "libavutil/attributes.h"
+#include "libavutil/macros.h"
+#include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_drm.h"
+#include "libavutil/hwcontext_v4l2request.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/refstruct.h"
 #include "v4l2_context.h"
@@ -51,6 +56,11 @@ static inline V4L2m2mContext *buf_to_m2mctx(V4L2Buffer *buf)
 static inline AVCodecContext *logger(V4L2Buffer *buf)
 {
     return buf_to_m2mctx(buf)->avctx;
+}
+
+static enum v4l2_memory v4l2_context_memory(const V4L2Context *ctx)
+{
+    return ctx->memory ? ctx->memory : V4L2_MEMORY_MMAP;
 }
 
 static inline AVRational v4l2_get_timebase(V4L2Buffer *avbuf)
@@ -493,6 +503,39 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
         (pixel_format == V4L2_PIX_FMT_NV12 ||
          pixel_format == V4L2_PIX_FMT_NV21))
         return v4l2_buffer_swframe_nv12_to_buf(frame, out, pixel_format);
+    if (pixel_format == V4L2_PIX_FMT_NV12M ||
+        pixel_format == V4L2_PIX_FMT_NV21M) {
+        const struct v4l2_pix_format_mplane *pix = &fmt.fmt.pix_mp;
+
+        if (out->num_planes != 2 || frame->width <= 0 || frame->height <= 0 ||
+            frame->width > pix->width || frame->height > pix->height ||
+            frame->format != (pixel_format == V4L2_PIX_FMT_NV12M ?
+                              AV_PIX_FMT_NV12 : AV_PIX_FMT_NV21))
+            return AVERROR(EINVAL);
+        for (i = 0; i < 2; i++) {
+            unsigned int rows = i ? AV_CEIL_RSHIFT(frame->height, 1) : frame->height;
+            unsigned int dst_rows = i ? AV_CEIL_RSHIFT(pix->height, 1) : pix->height;
+            unsigned int width = i ? FFALIGN(frame->width, 2) : frame->width;
+            unsigned int stride = pix->plane_fmt[i].bytesperline;
+            size_t size = (size_t)stride * dst_rows;
+            uint8_t *dst = out->plane_info[i].mm_addr;
+
+            ret = v4l2_frame_plane_bounds(frame, i, width, rows);
+            if (ret < 0)
+                return ret;
+            if (!dst || stride < width || size > out->plane_info[i].length ||
+                size > pix->plane_fmt[i].sizeimage)
+                return AVERROR(ENOSPC);
+            if (stride != width || dst_rows != rows)
+                memset(dst, 0, size);
+            for (unsigned int row = 0; row < rows; row++)
+                memcpy(dst + (size_t)row * stride,
+                       frame->data[i] + (ptrdiff_t)row * frame->linesize[i], width);
+            out->planes[i].data_offset = 0;
+            out->planes[i].bytesused = size;
+        }
+        return 0;
+    }
 
     switch (pixel_format) {
     case V4L2_PIX_FMT_YUV420M:
@@ -558,6 +601,141 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
     return 0;
 }
 
+static int v4l2_buffer_drmframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
+{
+    const AVDRMFrameDescriptor *desc;
+    const AVDRMLayerDescriptor *layer;
+    const AVDRMObjectDescriptor *object;
+    const struct v4l2_pix_format *pix = NULL;
+    const struct v4l2_pix_format_mplane *pix_mp = NULL;
+    AVFrame *hold;
+    size_t y_size, c_size;
+    unsigned int i;
+    int ret;
+    bool mplane = V4L2_TYPE_IS_MULTIPLANAR(out->buf.type);
+
+    if (frame->format != AV_PIX_FMT_DRM_PRIME ||
+        v4l2_context_memory(out->context) != V4L2_MEMORY_DMABUF ||
+        !frame->data[0]) {
+        av_log(logger(out), AV_LOG_DEBUG,
+               "v4l2: DRM import rejected by frame/memory precondition\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (frame->hw_frames_ctx) {
+        AVHWFramesContext *frames =
+            (AVHWFramesContext *)frame->hw_frames_ctx->data;
+
+        if (frames->device_ctx &&
+            frames->device_ctx->type == AV_HWDEVICE_TYPE_V4L2REQUEST) {
+            const AVV4L2RequestFrameDescriptor *request_desc =
+                (const AVV4L2RequestFrameDescriptor *)frame->data[0];
+
+            if (request_desc->wait) {
+                ret = request_desc->wait(request_desc->wait_opaque);
+                if (ret < 0)
+                    return ret;
+            }
+        }
+    }
+
+    desc = (const AVDRMFrameDescriptor *)frame->data[0];
+    if (desc->nb_objects != 1 || desc->nb_layers != 1)
+        return AVERROR(EINVAL);
+    layer = &desc->layers[0];
+    object = &desc->objects[0];
+    /* DRM fourcc NV12; modifier zero is the standard linear layout. */
+    if (layer->format != MKTAG('N', 'V', '1', '2') || layer->nb_planes != 2 ||
+        object->fd < 0 || object->format_modifier != 0 ||
+        layer->planes[0].object_index != 0 ||
+        layer->planes[1].object_index != 0 ||
+        layer->planes[0].pitch != layer->planes[1].pitch) {
+        av_log(logger(out), AV_LOG_DEBUG,
+               "v4l2: DRM descriptor layout rejected\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (mplane) {
+        if (out->num_planes != 2) {
+            av_log(logger(out), AV_LOG_ERROR,
+                   "DRM fail: out->num_planes=%d != 2\n", out->num_planes);
+            return AVERROR(EINVAL);
+        }
+        if (out->context->format.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12M) {
+            av_log(logger(out), AV_LOG_ERROR,
+                   "DRM fail: pix_mp.pixelformat=%#x != NV12M\n",
+                   out->context->format.fmt.pix_mp.pixelformat);
+            return AVERROR(EINVAL);
+        }
+        pix_mp = &out->context->format.fmt.pix_mp;
+        if (pix_mp->plane_fmt[0].bytesperline <= 0 ||
+            pix_mp->plane_fmt[1].bytesperline != pix_mp->plane_fmt[0].bytesperline) {
+            av_log(logger(out), AV_LOG_ERROR,
+                   "DRM fail: plane bytesperline %d / %d\n",
+                   pix_mp->plane_fmt[0].bytesperline,
+                   pix_mp->plane_fmt[1].bytesperline);
+            return AVERROR(EINVAL);
+        }
+        y_size = pix_mp->plane_fmt[0].sizeimage;
+        c_size = pix_mp->plane_fmt[1].sizeimage;
+        if (layer->planes[0].pitch != pix_mp->plane_fmt[0].bytesperline ||
+            layer->planes[1].pitch != pix_mp->plane_fmt[1].bytesperline ||
+            object->size > UINT32_MAX) {
+            av_log(logger(out), AV_LOG_ERROR,
+                   "DRM fail: pitch layer %td/%td vs v4l %d/%d or size %zu\n",
+                   layer->planes[0].pitch, layer->planes[1].pitch,
+                   pix_mp->plane_fmt[0].bytesperline,
+                   pix_mp->plane_fmt[1].bytesperline, object->size);
+            return AVERROR(EINVAL);
+        }
+    } else {
+        if (out->num_planes != 1)
+            return AVERROR(EINVAL);
+        pix = &out->context->format.fmt.pix;
+        y_size = (size_t)pix->bytesperline * pix->height;
+        c_size = (size_t)pix->bytesperline * ((pix->height + 1) / 2);
+        if (layer->planes[0].offset != 0 ||
+            layer->planes[1].offset !=
+                (uint64_t)pix->bytesperline * pix->height ||
+            layer->planes[0].pitch != (unsigned int)pix->bytesperline ||
+            layer->planes[1].pitch != (unsigned int)pix->bytesperline ||
+            object->size < y_size + c_size ||
+            object->size > UINT32_MAX)
+            return AVERROR(EINVAL);
+    }
+
+    if (object->size < y_size || object->size < c_size ||
+        layer->planes[0].offset > object->size - y_size ||
+        layer->planes[1].offset > object->size - c_size) {
+        av_log(logger(out), AV_LOG_ERROR,
+               "DRM fail: bounds obj_size=%zu y_size=%zu c_size=%zu y_off=%#"PRIx64" c_off=%#"PRIx64"\n",
+               object->size, y_size, c_size, layer->planes[0].offset, layer->planes[1].offset);
+        return AVERROR(EINVAL);
+    }
+
+    hold = av_frame_clone(frame);
+    if (!hold)
+        return AVERROR(ENOMEM);
+    av_frame_free(&out->imported_frame);
+    out->imported_frame = hold;
+
+    if (mplane) {
+        for (i = 0; i < 2; i++) {
+            out->planes[i].m.fd = object->fd;
+            out->planes[i].data_offset = layer->planes[i].offset;
+            out->planes[i].bytesused = layer->planes[i].offset + (i ? c_size : y_size);
+            out->planes[i].length = object->size;
+        }
+        out->buf.length = 2;
+        out->buf.m.planes = out->planes;
+    } else {
+        out->buf.m.fd = object->fd;
+        out->buf.length = object->size;
+        out->buf.bytesused = y_size + c_size;
+    }
+    return 0;
+}
+
 /******************************************************************************
  *
  *              V4L2Buffer interface
@@ -567,6 +745,9 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 int ff_v4l2_buffer_avframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 {
     v4l2_set_pts(out, frame->pts);
+
+    if (frame->format == AV_PIX_FMT_DRM_PRIME)
+        return v4l2_buffer_drmframe_to_buf(frame, out);
 
     return v4l2_buffer_swframe_to_buf(frame, out);
 }
@@ -609,6 +790,10 @@ int ff_v4l2_buffer_buf_to_avframe(AVFrame *frame, V4L2Buffer *avbuf)
 
 int ff_v4l2_buffer_buf_to_avpkt(AVPacket *pkt, V4L2Buffer *avbuf)
 {
+    const uint8_t *data = avbuf->plane_info[0].mm_addr;
+    unsigned int bytesused = V4L2_TYPE_IS_MULTIPLANAR(avbuf->buf.type) ?
+                             avbuf->planes[0].bytesused : avbuf->buf.bytesused;
+    unsigned int offset = avbuf->planes[0].data_offset;
     int ret;
 
     av_packet_unref(pkt);
@@ -675,13 +860,27 @@ int ff_v4l2_buffer_initialize(V4L2Buffer* avbuf, int index)
     V4L2Context *ctx = avbuf->context;
     int ret, i;
 
-    avbuf->buf.memory = V4L2_MEMORY_MMAP;
+    avbuf->buf.memory = v4l2_context_memory(ctx);
     avbuf->buf.type = ctx->type;
     avbuf->buf.index = index;
 
     if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
         avbuf->buf.length = VIDEO_MAX_PLANES;
         avbuf->buf.m.planes = avbuf->planes;
+    }
+
+    if (avbuf->buf.memory == V4L2_MEMORY_DMABUF) {
+        if (!V4L2_TYPE_IS_OUTPUT(ctx->type))
+            return AVERROR(EINVAL);
+        if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
+            avbuf->num_planes = ctx->format.fmt.pix_mp.num_planes;
+            avbuf->buf.length = avbuf->num_planes;
+            avbuf->buf.m.planes = avbuf->planes;
+        } else {
+            avbuf->num_planes = 1;
+        }
+        avbuf->status = V4L2BUF_AVAILABLE;
+        return 0;
     }
 
     ret = ioctl(buf_to_m2mctx(avbuf)->fd, VIDIOC_QUERYBUF, &avbuf->buf);
@@ -739,18 +938,15 @@ int ff_v4l2_buffer_initialize(V4L2Buffer* avbuf, int index)
 
 int ff_v4l2_buffer_enqueue(V4L2Buffer* avbuf)
 {
-    const uint8_t *data = avbuf->plane_info[0].mm_addr;
-    unsigned int bytesused = V4L2_TYPE_IS_MULTIPLANAR(avbuf->buf.type) ?
-                             avbuf->planes[0].bytesused : avbuf->buf.bytesused;
-    unsigned int offset = avbuf->planes[0].data_offset;
     int ret;
 
     avbuf->buf.flags = avbuf->flags;
-
     ret = ioctl(buf_to_m2mctx(avbuf)->fd, VIDIOC_QBUF, &avbuf->buf);
-    if (ret < 0)
+    if (ret < 0) {
+        av_log(logger(avbuf), AV_LOG_ERROR,
+               "VIDIOC_QBUF failed: errno=%d (%s)\n", errno, av_err2str(AVERROR(errno)));
         return AVERROR(errno);
-
+    }
     avbuf->status = V4L2BUF_IN_DRIVER;
 
     return 0;
