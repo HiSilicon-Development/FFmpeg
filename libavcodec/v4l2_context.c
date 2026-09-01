@@ -607,8 +607,10 @@ int ff_v4l2_context_enqueue_packet(V4L2Context* ctx, const AVPacket* pkt)
 
     if (!pkt->size) {
         ret = v4l2_stop_decode(ctx);
-        if (ret)
+        if (ret) {
             av_log(logger(ctx), AV_LOG_ERROR, "%s stop_decode\n", ctx->name);
+            return ret;
+        }
         s->draining = 1;
         return 0;
     }
