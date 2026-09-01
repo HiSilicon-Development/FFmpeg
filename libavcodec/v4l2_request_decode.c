@@ -407,8 +407,37 @@ static int v4l2_request_post_process(void *logctx, AVFrame *frame)
     FrameDecodeData *fdd = frame->private_ref;
     V4L2RequestContext *ctx = fdd->hwaccel_priv;
 
-    // Wait on capture buffer before returning the frame to application
-    return ff_v4l2_request_wait_capture(ctx, &desc->capture, true);
+    int ret = ff_v4l2_request_wait_capture(ctx, &desc->capture, true);
+
+    if (ret < 0)
+        return ret;
+
+    /*
+     * ff_get_buffer() initially describes the coded picture.  A V4L2
+     * post-processor may allocate a smaller capture buffer, so publish the
+     * actual DMA buffer dimensions before filters or encoders consume it.
+     */
+    if (frame->width != desc->capture.width ||
+        frame->height != desc->capture.height) {
+        unsigned int visible_width = frame->width -
+                                     frame->crop_left - frame->crop_right;
+        unsigned int visible_height = frame->height -
+                                      frame->crop_top - frame->crop_bottom;
+
+        if (frame->sample_aspect_ratio.num > 0 &&
+            visible_width && visible_height) {
+            frame->sample_aspect_ratio = av_mul_q(frame->sample_aspect_ratio,
+                av_div_q((AVRational) { visible_width, visible_height },
+                         (AVRational) { desc->capture.width,
+                                        desc->capture.height }));
+        }
+        frame->width = desc->capture.width;
+        frame->height = desc->capture.height;
+        frame->crop_left = frame->crop_right = 0;
+        frame->crop_top = frame->crop_bottom = 0;
+    }
+
+    return 0;
 }
 
 int ff_v4l2_request_reset_picture(AVCodecContext *avctx, V4L2RequestPictureContext *pic)

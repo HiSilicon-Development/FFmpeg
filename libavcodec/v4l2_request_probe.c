@@ -178,19 +178,78 @@ static int v4l2_request_set_format(AVCodecContext *avctx,
                                    uint32_t buffersize)
 {
     V4L2RequestContext *ctx = v4l2_request_context(avctx);
+    unsigned int width = avctx->coded_width;
+    unsigned int height = avctx->coded_height;
+    bool capture_size_override = false;
     struct v4l2_format format = {
         .type = type,
     };
 
+    if (!V4L2_TYPE_IS_OUTPUT(type)) {
+        const char *size = getenv("HISTB_V4L2REQUEST_CAPTURE_SIZE");
+        bool bounded = false;
+
+        if (!size) {
+            size = getenv("HISTB_V4L2REQUEST_MAX_CAPTURE_SIZE");
+            bounded = true;
+        }
+
+        if (size) {
+            char *end;
+            unsigned long requested_width;
+            unsigned long requested_height;
+
+            errno = 0;
+            requested_width = strtoul(size, &end, 10);
+            if (errno || end == size || (*end != 'x' && *end != 'X'))
+                goto invalid_capture_size;
+
+            size = end + 1;
+            errno = 0;
+            requested_height = strtoul(size, &end, 10);
+            if (errno || end == size || *end || !requested_width ||
+                !requested_height || requested_width > UINT32_MAX ||
+                requested_height > UINT32_MAX ||
+                (!bounded && (requested_width > avctx->coded_width ||
+                              requested_height > avctx->coded_height)))
+                goto invalid_capture_size;
+
+            if (!bounded) {
+                width = requested_width;
+                height = requested_height;
+            } else if (avctx->width > requested_width ||
+                       avctx->height > requested_height) {
+                if ((int64_t)avctx->width * requested_height >
+                    (int64_t)avctx->height * requested_width) {
+                    width = requested_width & ~3U;
+                    height = ((int64_t)avctx->height * width /
+                              avctx->width) & ~1U;
+                } else {
+                    height = requested_height & ~1U;
+                    width = ((int64_t)avctx->width * height /
+                             avctx->height) & ~3U;
+                }
+                if (!width || !height)
+                    goto invalid_capture_size;
+            }
+            capture_size_override = width != avctx->coded_width ||
+                                    height != avctx->coded_height;
+            if (capture_size_override)
+                av_log(avctx, AV_LOG_INFO,
+                       "Requesting V4L2 capture downscale from %dx%d to %ux%u\n",
+                       avctx->coded_width, avctx->coded_height, width, height);
+        }
+    }
+
     if (V4L2_TYPE_IS_MULTIPLANAR(type)) {
-        format.fmt.pix_mp.width = avctx->coded_width;
-        format.fmt.pix_mp.height = avctx->coded_height;
+        format.fmt.pix_mp.width = width;
+        format.fmt.pix_mp.height = height;
         format.fmt.pix_mp.pixelformat = pixelformat;
         format.fmt.pix_mp.plane_fmt[0].sizeimage = buffersize;
         format.fmt.pix_mp.num_planes = 1;
     } else {
-        format.fmt.pix.width = avctx->coded_width;
-        format.fmt.pix.height = avctx->coded_height;
+        format.fmt.pix.width = width;
+        format.fmt.pix.height = height;
         format.fmt.pix.pixelformat = pixelformat;
         format.fmt.pix.sizeimage = buffersize;
     }
@@ -198,7 +257,29 @@ static int v4l2_request_set_format(AVCodecContext *avctx,
     if (ioctl(ctx->video_fd, VIDIOC_S_FMT, &format) < 0)
         return AVERROR(errno);
 
+    if (capture_size_override) {
+        unsigned int actual_width = V4L2_TYPE_IS_MULTIPLANAR(type) ?
+                                    format.fmt.pix_mp.width :
+                                    format.fmt.pix.width;
+        unsigned int actual_height = V4L2_TYPE_IS_MULTIPLANAR(type) ?
+                                     format.fmt.pix_mp.height :
+                                     format.fmt.pix.height;
+
+        if (actual_width != width || actual_height != height) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "V4L2 capture driver changed requested %ux%u size to %ux%u\n",
+                   width, height, actual_width, actual_height);
+            return AVERROR(EINVAL);
+        }
+    }
+
     return 0;
+
+invalid_capture_size:
+    av_log(avctx, AV_LOG_ERROR,
+           "Invalid HISTB_V4L2REQUEST capture size; expected a non-zero "
+           "WIDTHxHEIGHT (an explicit size must fit the coded frame)\n");
+    return AVERROR(EINVAL);
 }
 
 static int v4l2_request_select_capture_format(AVCodecContext *avctx)
