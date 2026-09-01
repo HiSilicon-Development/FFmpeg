@@ -65,9 +65,11 @@ static int v4l2_request_queue_buffer(V4L2RequestContext *ctx, int request_fd,
 
     // Mark the buffer as queued
     if (V4L2_TYPE_IS_OUTPUT(buffer.type))
-        atomic_fetch_or(&ctx->queued_output, 1 << buffer.index);
-    else
-        atomic_fetch_or(&ctx->queued_capture, 1 << buffer.index);
+        atomic_fetch_or(&ctx->queued_output, 1U << buffer.index);
+    else {
+        atomic_fetch_and(&ctx->capture_errors, ~(UINT64_C(1) << buffer.index));
+        atomic_fetch_or(&ctx->queued_capture, UINT64_C(1) << buffer.index);
+    }
 
     return 0;
 }
@@ -90,11 +92,30 @@ static int v4l2_request_dequeue_buffer(V4L2RequestContext *ctx,
     if (ioctl(ctx->video_fd, VIDIOC_DQBUF, &buffer) < 0)
         return AVERROR(errno);
 
+    /*
+     * The driver marks a capture buffer it could not fill with
+     * V4L2_BUF_FLAG_ERROR.  The m2m path in v4l2_buffers.c reports this as a
+     * decode error; the request path did not look at the flag at all, so a
+     * driver-side failure arrived at the caller as black pixels or as
+     * uninitialised memory with a successful decode count.  Measured on
+     * IP1001: the histb-vdec driver rejected every frame of a 3840x2160
+     * H.264 stream with -ENOMEM, marked each job VB2_BUF_STATE_ERROR, and
+     * ffmpeg still reported five decoded frames whose contents were entirely
+     * zero.  Log it here so the failure is at least visible.
+     */
+    if (!V4L2_TYPE_IS_OUTPUT(buffer.type) &&
+        (buffer.flags & V4L2_BUF_FLAG_ERROR)) {
+        atomic_fetch_or(&ctx->capture_errors, UINT64_C(1) << buffer.index);
+        av_log(ctx, AV_LOG_ERROR,
+               "capture buffer %u carries V4L2_BUF_FLAG_ERROR; the driver did not "
+               "produce this frame\n", buffer.index);
+    }
+
     // Mark the buffer as dequeued
     if (V4L2_TYPE_IS_OUTPUT(buffer.type))
         atomic_fetch_and(&ctx->queued_output, ~(1 << buffer.index));
     else
-        atomic_fetch_and(&ctx->queued_capture, ~(1 << buffer.index));
+        atomic_fetch_and(&ctx->queued_capture, ~(UINT64_C(1) << buffer.index));
 
     return 0;
 }
@@ -111,8 +132,8 @@ static inline int v4l2_request_dequeue_completed_buffers(V4L2RequestContext *ctx
     return ret;
 }
 
-static int v4l2_request_wait_on_capture(V4L2RequestContext *ctx,
-                                        V4L2RequestBuffer *capture)
+int ff_v4l2_request_wait_capture(V4L2RequestContext *ctx,
+                               V4L2RequestBuffer *capture, bool check_error)
 {
     struct pollfd pollfd = {
         .fd = ctx->video_fd,
@@ -126,7 +147,7 @@ static int v4l2_request_wait_on_capture(V4L2RequestContext *ctx,
         v4l2_request_dequeue_completed_buffers(ctx, ctx->format.type);
 
     // Wait on the specific capture buffer, when needed
-    while (atomic_load(&ctx->queued_capture) & (1 << capture->index)) {
+    while (atomic_load(&ctx->queued_capture) & (UINT64_C(1) << capture->index)) {
         int ret = poll(&pollfd, 1, 2000);
         if (ret <= 0)
             goto fail;
@@ -137,7 +158,8 @@ static int v4l2_request_wait_on_capture(V4L2RequestContext *ctx,
     }
 
     ff_mutex_unlock(&ctx->mutex);
-    return 0;
+    return (check_error && (atomic_load(&ctx->capture_errors) &
+            (UINT64_C(1) << capture->index))) ? AVERROR_INVALIDDATA : 0;
 
 fail:
     ff_mutex_unlock(&ctx->mutex);
@@ -382,7 +404,7 @@ static int v4l2_request_post_process(void *logctx, AVFrame *frame)
     V4L2RequestContext *ctx = fdd->hwaccel_priv;
 
     // Wait on capture buffer before returning the frame to application
-    return v4l2_request_wait_on_capture(ctx, &desc->capture);
+    return ff_v4l2_request_wait_capture(ctx, &desc->capture, true);
 }
 
 int ff_v4l2_request_reset_picture(AVCodecContext *avctx, V4L2RequestPictureContext *pic)
@@ -412,7 +434,9 @@ int ff_v4l2_request_start_frame(AVCodecContext *avctx,
         return ret;
 
     // Ensure capture buffer is dequeued before reuse
-    ret = v4l2_request_wait_on_capture(ctx, &desc->capture);
+    /* Reusing a completed failed buffer is valid: QBUF starts a new
+     * payload lifetime and clears its old error. Consumers still fail. */
+    ret = ff_v4l2_request_wait_capture(ctx, &desc->capture, false);
     if (ret)
         return ret;
 

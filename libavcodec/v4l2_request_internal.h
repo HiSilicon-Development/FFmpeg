@@ -34,6 +34,9 @@ static inline V4L2RequestContext *v4l2_request_context(AVCodecContext *avctx)
     return (V4L2RequestContext *)avctx->internal->hwaccel_priv_data;
 }
 
+int ff_v4l2_request_wait_capture(V4L2RequestContext *ctx,
+                               V4L2RequestBuffer *capture, bool check_error);
+
 static inline V4L2RequestFrameDescriptor *v4l2_request_framedesc(AVFrame *frame)
 {
     return (V4L2RequestFrameDescriptor *)frame->data[0];

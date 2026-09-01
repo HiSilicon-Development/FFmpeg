@@ -357,6 +357,7 @@ static int v4l2_request_init_context(AVCodecContext *avctx)
     atomic_init(&ctx->queued_output, 0);
     atomic_init(&ctx->queued_request, 0);
     atomic_init(&ctx->queued_capture, 0);
+    atomic_init(&ctx->capture_errors, 0);
 
     // Get format details for capture buffers
     if (ioctl(ctx->video_fd, VIDIOC_G_FMT, &ctx->format) < 0) {
