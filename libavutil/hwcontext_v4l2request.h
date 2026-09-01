@@ -19,6 +19,8 @@
 #ifndef AVUTIL_HWCONTEXT_V4L2REQUEST_H
 #define AVUTIL_HWCONTEXT_V4L2REQUEST_H
 
+#include "hwcontext_drm.h"
+
 /**
  * @file
  * An API-specific header for AV_HWDEVICE_TYPE_V4L2REQUEST.
@@ -45,5 +47,18 @@ typedef struct AVV4L2RequestDeviceContext {
 typedef struct AVV4L2RequestFramesContext {
     int bytesperline;
 } AVV4L2RequestFramesContext;
+
+/**
+ * V4L2 Request frame descriptor.
+ *
+ * The DRM descriptor is first so AVFrame.data[0] remains compatible with
+ * AV_PIX_FMT_DRM_PRIME consumers.  The optional wait callback allows a
+ * producer to defer completion until a consumer actually maps the frame.
+ */
+typedef struct AVV4L2RequestFrameDescriptor {
+    AVDRMFrameDescriptor drm;
+    int (*wait)(void *opaque);
+    void *wait_opaque;
+} AVV4L2RequestFrameDescriptor;
 
 #endif /* AVUTIL_HWCONTEXT_V4L2REQUEST_H */

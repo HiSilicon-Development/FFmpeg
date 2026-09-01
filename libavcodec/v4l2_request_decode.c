@@ -172,6 +172,18 @@ fail:
     return AVERROR(EINVAL);
 }
 
+static int v4l2_request_wait_on_frame(void *opaque)
+{
+    V4L2RequestFrameDescriptor *desc = opaque;
+    V4L2RequestContext *ctx;
+
+    if (!desc || !desc->ctx)
+        return AVERROR(EINVAL);
+
+    ctx = desc->ctx;
+    return ff_v4l2_request_wait_capture(ctx, &desc->capture, true);
+}
+
 static V4L2RequestBuffer *v4l2_request_next_output(V4L2RequestContext *ctx)
 {
     int index;
@@ -406,11 +418,27 @@ static int v4l2_request_post_process(void *logctx, AVFrame *frame)
     V4L2RequestFrameDescriptor *desc = v4l2_request_framedesc(frame);
     FrameDecodeData *fdd = frame->private_ref;
     V4L2RequestContext *ctx = fdd->hwaccel_priv;
+    bool defer = ctx->defer_capture_wait &&
+        (!ctx->defer_capture_wait_auto ||
+         (!(frame->flags & AV_FRAME_FLAG_INTERLACED) &&
+          (frame->width > desc->capture.width ||
+           frame->height > desc->capture.height)));
+    int ret;
 
-    int ret = ff_v4l2_request_wait_capture(ctx, &desc->capture, true);
-
-    if (ret < 0)
-        return ret;
+    /*
+     * The normal path completes capture before publishing the frame.  The
+     * opt-in pipeline path publishes the DRM frame as soon as its request has
+     * been queued, then waits when hwdownload actually maps it.  This lets the
+     * frame-thread parser queue the next request while the device finishes
+     * VDH/VPSS, without exposing incomplete pixels to the CPU.
+     */
+    if (!defer) {
+        ret = ff_v4l2_request_wait_capture(ctx, &desc->capture, true);
+        if (ret < 0)
+            return ret;
+        desc->base.wait = NULL;
+        desc->base.wait_opaque = NULL;
+    }
 
     /*
      * ff_get_buffer() initially describes the coded picture.  A V4L2
@@ -476,6 +504,10 @@ int ff_v4l2_request_start_frame(AVCodecContext *avctx,
     // Wait on capture buffer in post_process() before returning to application
     fdd->hwaccel_priv = ctx;
     fdd->post_process = v4l2_request_post_process;
+
+    desc->ctx = v4l2_request_capture_context(ctx);
+    desc->base.wait = v4l2_request_wait_on_frame;
+    desc->base.wait_opaque = desc;
 
     // Capture buffer used for current frame
     pic->capture = &desc->capture;

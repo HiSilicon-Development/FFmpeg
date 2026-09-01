@@ -19,6 +19,7 @@
 #include "config.h"
 
 #include <fcntl.h>
+#include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -424,6 +425,10 @@ static int v4l2_request_init_context(AVCodecContext *avctx)
     atomic_init(&ctx->queued_request, 0);
     atomic_init(&ctx->queued_capture, 0);
     atomic_init(&ctx->capture_errors, 0);
+    ctx->defer_capture_wait =
+        getenv("HISTB_V4L2REQUEST_DEFER_CAPTURE_WAIT") != NULL;
+    ctx->defer_capture_wait_auto = ctx->defer_capture_wait &&
+        !strcmp(getenv("HISTB_V4L2REQUEST_DEFER_CAPTURE_WAIT"), "auto");
 
     // Get format details for capture buffers
     if (ioctl(ctx->video_fd, VIDIOC_G_FMT, &ctx->format) < 0) {

@@ -106,7 +106,7 @@ enum AVPixelFormat ff_v4l2_request_get_sw_format(struct v4l2_format *format)
 int ff_v4l2_request_set_drm_descriptor(V4L2RequestFrameDescriptor *framedesc,
                                        struct v4l2_format *format)
 {
-    AVDRMFrameDescriptor *desc = &framedesc->base;
+    AVDRMFrameDescriptor *desc = &framedesc->base.drm;
     AVDRMLayerDescriptor *layer = &desc->layers[0];
     uint32_t pixelformat = V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
                            format->fmt.pix_mp.pixelformat :

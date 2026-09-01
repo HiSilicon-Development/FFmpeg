@@ -123,13 +123,21 @@ static void v4l2request_unmap_frame(AVHWFramesContext *hwfc,
 static int v4l2request_map_frame(AVHWFramesContext *hwfc,
                                  AVFrame *dst, const AVFrame *src)
 {
-    const AVDRMFrameDescriptor *desc = (AVDRMFrameDescriptor *)src->data[0];
+    const AVV4L2RequestFrameDescriptor *request_desc =
+        (AVV4L2RequestFrameDescriptor *)src->data[0];
+    const AVDRMFrameDescriptor *desc = &request_desc->drm;
     struct dma_buf_sync sync = {
         .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
     };
     DRMMapping *map;
     int ret, i, p, plane;
     void *addr;
+
+    if (request_desc->wait) {
+        ret = request_desc->wait(request_desc->wait_opaque);
+        if (ret < 0)
+            return ret;
+    }
 
     map = av_mallocz(sizeof(*map));
     if (!map)
@@ -188,6 +196,31 @@ fail:
     }
     av_free(map);
     return ret;
+}
+
+static int v4l2request_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
+                                const AVFrame *src, int flags)
+{
+    const AVV4L2RequestFrameDescriptor *desc =
+        (const AVV4L2RequestFrameDescriptor *)src->data[0];
+    int ret;
+
+    if (dst->format == AV_PIX_FMT_NONE)
+        dst->format = hwfc->sw_format;
+    if (dst->format == hwfc->sw_format && !(flags & AV_HWFRAME_MAP_WRITE)) {
+        ret = v4l2request_map_frame(hwfc, dst, src);
+        if (ret < 0)
+            return ret;
+        return av_frame_copy_props(dst, src);
+    }
+
+    /* Foreign hardware importers must not bypass capture-error checks. */
+    if (desc->wait) {
+        ret = desc->wait(desc->wait_opaque);
+        if (ret < 0)
+            return ret;
+    }
+    return AVERROR(ENOSYS);
 }
 
 static int v4l2request_transfer_get_formats(AVHWFramesContext *hwfc,
@@ -254,6 +287,7 @@ const HWContextType ff_hwcontext_type_v4l2request = {
 
     .transfer_get_formats   = v4l2request_transfer_get_formats,
     .transfer_data_from     = v4l2request_transfer_data_from,
+    .map_from               = v4l2request_map_from,
 
     .pix_fmts = (const enum AVPixelFormat[]) {
         AV_PIX_FMT_DRM_PRIME,

@@ -21,11 +21,12 @@
 
 #include <linux/media.h>
 
+#include "libavutil/hwcontext_v4l2request.h"
 #include "internal.h"
 #include "v4l2_request.h"
 
 typedef struct V4L2RequestFrameDescriptor {
-    AVDRMFrameDescriptor base;
+    AVV4L2RequestFrameDescriptor base;
     V4L2RequestBuffer capture;
     V4L2RequestContext *ctx;
     AVBufferRef *capture_ref;
