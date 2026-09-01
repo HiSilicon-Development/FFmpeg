@@ -340,11 +340,20 @@ static void OPNAME ## cavs_filt16_h_ ## NAME(uint8_t *dst, const uint8_t *src, p
     OPNAME ## cavs_filt8_h_ ## NAME(dst+8, src+8, dstStride, srcStride);\
 }\
 
+/**
+ * Two dimensional sub sample interpolation, the horizontal pass first.
+ *
+ * temp[] has to be wider than 16 bits: the quarter sample positions i and
+ * k of clause 9.9.2.2 are computed here as a horizontal filter with the
+ * composite weights (-1, -2, 96, 42, -7), mirrored for k, followed by a
+ * vertical (-1, 5, 5, -1), and the horizontal pass alone reaches
+ * (96 + 42) * 255 = 35190.
+ */
 #define CAVS_SUBPIX_HV(OPNAME, OP, NAME, AH, BH, CH, DH, EH, FH, AV, BV, CV, DV, EV, FV, FULL) \
 static void OPNAME ## cavs_filt8_hv_ ## NAME(uint8_t *dst, const uint8_t *src1, const uint8_t *src2, ptrdiff_t dstStride, ptrdiff_t srcStride)\
 {                                                                       \
-    int16_t temp[8*(8+5)];\
-    int16_t *tmp = temp;\
+    int temp[8*(8+5)];\
+    int *tmp = temp;\
     const int h=8;\
     const int w=8;\
     const uint8_t *cm = ff_crop_tab + MAX_NEG_CROP;\
@@ -577,7 +586,9 @@ av_cold void ff_cavsdsp_init(CAVSDSPContext* c)
     c->cavs_idct8_add = cavs_idct8_add_c;
     c->idct_perm = FF_IDCT_PERM_NONE;
 
-#if ARCH_X86 && HAVE_X86ASM
+#if ARCH_AARCH64
+    ff_cavsdsp_init_aarch64(c);
+#elif ARCH_X86 && HAVE_X86ASM
     ff_cavsdsp_init_x86(c);
 #endif
 }

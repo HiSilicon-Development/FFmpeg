@@ -24,12 +24,15 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "libavutil/attributes.h"
+#include "libavutil/common.h"
 #include "libavutil/frame.h"
 #include "libavutil/mem_internal.h"
 
 #include "avcodec.h"
+#include "cavs_aec.h"
 #include "cavsdsp.h"
 #include "blockdsp.h"
 #include "h264chroma.h"
@@ -40,8 +43,10 @@
 #define EXT_START_CODE          0x000001b5
 #define USER_START_CODE         0x000001b2
 #define CAVS_START_CODE         0x000001b0
+#define CAVS_END_CODE           0x000001b1
 #define PIC_I_START_CODE        0x000001b3
 #define PIC_PB_START_CODE       0x000001b6
+#define VIDEO_EDIT_START_CODE   0x000001b7
 
 #define A_AVAIL                          1
 #define B_AVAIL                          2
@@ -86,6 +91,21 @@ enum cavs_sub_mb {
   B_SUB_BWD,
   B_SUB_SYM
 };
+
+/** Apply one AVS weighted-prediction scale/shift pair (clause 9.9.3). */
+static inline uint8_t ff_cavs_weight_sample(uint8_t pred, int scale, int shift)
+{
+    return av_clip_uint8(((pred * scale + 16) >> 5) + shift);
+}
+
+/** Map one reference to its slice weight slot (clause 9.9.3). */
+static inline int ff_cavs_weight_index(enum AVPictureType pict_type,
+                                       int ref, int ref_base, int list)
+{
+    int index = ref - ref_base;
+
+    return pict_type == AV_PICTURE_TYPE_B ? 2 * index + list : index;
+}
 
 enum cavs_intra_luma {
   INTRA_L_VERT,
@@ -152,6 +172,9 @@ typedef struct cavs_vector {
     int16_t y;
     int16_t dist;
     int16_t ref;
+    /** mb_reference_index of the block, 0 when it codes none (cl. 9.4.5);
+       ref above is where the reference list puts it */
+    int16_t ref_idx;
 } cavs_vector;
 
 struct dec_2dvlc {
@@ -165,7 +188,54 @@ struct dec_2dvlc {
 typedef struct AVSFrame {
     AVFrame *f;
     int poc;
+    void *hwaccel_picture_private;
 } AVSFrame;
+
+#define CAVS_SEQUENCE_FLAG_PROGRESSIVE              (1ULL << 0)
+#define CAVS_SEQUENCE_FLAG_LOW_DELAY                (1ULL << 1)
+
+#define CAVS_PICTURE_FLAG_PROGRESSIVE_FRAME         (1U << 0)
+#define CAVS_PICTURE_FLAG_TOP_FIELD_FIRST           (1U << 1)
+#define CAVS_PICTURE_FLAG_REPEAT_FIRST_FIELD        (1U << 2)
+#define CAVS_PICTURE_FLAG_FIXED_QP                  (1U << 3)
+#define CAVS_PICTURE_FLAG_SKIP_MODE                 (1U << 4)
+#define CAVS_PICTURE_FLAG_LOOP_FILTER_DISABLE       (1U << 5)
+#define CAVS_PICTURE_FLAG_LOOP_FILTER_PARAMS        (1U << 6)
+#define CAVS_PICTURE_FLAG_REFERENCE                 (1U << 7)
+#define CAVS_PICTURE_FLAG_NO_FORWARD_REFERENCE      (1U << 8)
+#define CAVS_PICTURE_FLAG_ADVANCED_PRED_DISABLE     (1U << 9)
+#define CAVS_PICTURE_FLAG_WEIGHTING_QUANT           (1U << 10)
+#define CAVS_PICTURE_FLAG_CHROMA_QP_DISABLE         (1U << 11)
+#define CAVS_PICTURE_FLAG_AEC                       (1U << 12)
+#define CAVS_PICTURE_FLAG_P_FIELD_ENHANCED          (1U << 13)
+#define CAVS_PICTURE_FLAG_B_FIELD_ENHANCED          (1U << 14)
+
+typedef struct AVSSequenceHeader {
+    uint16_t width;
+    uint16_t height;
+    uint8_t profile_id;
+    uint8_t level_id;
+    uint8_t chroma_format;
+    uint8_t sample_precision;
+    uint8_t aspect_ratio;
+    uint8_t frame_rate_code;
+    uint64_t flags;
+    int valid;
+} AVSSequenceHeader;
+
+typedef struct AVSPictureHeader {
+    uint32_t flags;
+    uint32_t bbv_delay;
+    uint32_t picture_distance;
+    uint8_t picture_coding_type;
+    uint8_t picture_structure;
+    uint8_t picture_qp;
+    int8_t alpha_c_offset;
+    int8_t beta_offset;
+    int8_t chroma_qp_delta_u;
+    int8_t chroma_qp_delta_v;
+    uint16_t weighting_quant_matrix[64];
+} AVSPictureHeader;
 
 typedef struct AVSContext {
     AVCodecContext *avctx;
@@ -175,9 +245,17 @@ typedef struct AVSContext {
     CAVSDSPContext  cdsp;
     GetBitContext gb;
     AVSFrame cur;     ///< currently decoded frame
-    AVSFrame DPB[2];  ///< reference frames
-    int dist[2];     ///< temporal distances from current frame to ref frames
+    AVSFrame DPB[3];  ///< reference frames, newest first
+    /** The reference of every reference index, cl. 9.4.5: a frame, or the
+       field of one starting at parity; both lists share the array. */
+    struct {
+        AVFrame *f;   ///< frame the reference belongs to
+        int parity;   ///< first line of the reference field inside it
+    } ref[4];
+    int ref_base[2]; ///< first entry of the forward and the backward list
+    int dist[4];     ///< BlockDistance of every reference, cl. 9.4.6.1
     int low_delay;
+    int progressive_seq;
     int profile, level;
     int aspect_ratio;
     int mb_width, mb_height;
@@ -185,7 +263,33 @@ typedef struct AVSContext {
     int stream_revision; ///<0 for samples from 2006, 1 for rm52j encoder
     int progressive;
     int pic_structure;
+    int top_field_first; ///< the first coded field is the top one, cl. 7.2.3
+    /** the coded field the current macroblock belongs to, 0 or 1, cl. 3.24 */
+    int field;
+    int field_mby;      ///< macroblock row of the current macroblock in it
     int skip_mode_flag; ///< select between skip_count or one skip_flag per MB
+    /** PFieldSkip for P pictures, BFieldEnhanced for B pictures (cl. 9.9.1). */
+    int pb_field_enhanced;
+    int slice_weighting_flag;
+    int mb_weighting_flag;
+    int weighting_prediction;
+    uint8_t luma_scale[4];
+    int8_t luma_shift[4];
+    uint8_t chroma_scale[4];
+    int8_t chroma_shift[4];
+    int aec_enable;     ///< AVS1-P16 arithmetic coding of the macroblock layer
+    CAVSAECContext aec; ///< AEC engine and context models, cl. 8.4
+    int prev_delta_qp;  ///< PreviousDeltaQP of cl. 9.4.8, an AEC context
+    int left_cbp;       ///< MbCBP of the macroblock to the left
+    uint8_t *top_cbp;   ///< MbCBP of the macroblock above, one per column
+    /** MbType of the macroblock to the left, cl. 8.4.4.2 b) */
+    int left_mb_type;
+    /** MbType of the macroblock above, one per column */
+    uint8_t *top_mb_type;
+    /** IntraChromaPredMode of the macroblock to the left, cl. 8.4.4.2 e) */
+    int left_c_pred_mode;
+    /** IntraChromaPredMode of the macroblock above, one per column */
+    uint8_t *top_c_pred_mode;
     int loop_filter_disable;
     int alpha_offset, beta_offset;
     int ref_flag;
@@ -209,6 +313,8 @@ typedef struct AVSContext {
 
        the same is repeated for backward motion vectors */
     DECLARE_ALIGNED(8, cavs_vector, mv)[2*4*3];
+    /** mv_diff of the same blocks, for the ctxIdxInc of cl. 8.4.4.2 g) */
+    int16_t mvd[2*4*3][2];
     cavs_vector *top_mv[2];
     cavs_vector *col_mv;
 
@@ -226,6 +332,16 @@ typedef struct AVSContext {
     int cbp;
     DECLARE_ALIGNED(32, int16_t, block)[64];
     uint8_t permutated_scantable[64];
+    /** inverse block scan method 2 of cl. 9.5.3 c), for field pictures */
+    uint8_t permutated_scantable_field[64];
+    /** the one of the two the current picture uses, selected in decode_pic() */
+    const uint8_t *scantable;
+    uint8_t weighting_scantable[64];
+    uint8_t weighting_scantable_field[64];
+    const uint8_t *weighting_scan;
+    uint16_t weighting_quant_matrix[64];
+    int weighting_quant;
+    int chroma_qp_delta[2];
 
     /** intra prediction is done with un-deblocked samples
      they are saved here before deblocking the MB  */
@@ -238,14 +354,25 @@ typedef struct AVSContext {
     void (*intra_pred_c[7])(uint8_t *d, uint8_t *top, uint8_t *left, ptrdiff_t stride);
     uint8_t *col_type_base;
 
-    /* scaling factors for MV prediction */
-    int sym_factor;    ///< for scaling in symmetrical B block
-    int direct_den[2]; ///< for scaling in direct B block
-    int scale_den[2];  ///< for scaling neighbouring MVs
+    /** 512 / dist[], for scaling neighbouring MVs (cl. 9.4.6.2 step 3) */
+    int scale_den[4];
 
     uint8_t *edge_emu_buffer;
 
+    /** picture payload with the annex A pseudo start code escapes removed,
+        allocated only for the pictures that carry one */
+    uint8_t *deemulated_buf;
+    unsigned int deemulated_buf_size; ///< allocated size of deemulated_buf
+    /** byte offsets in deemulated_buf at which a start code prefix of the
+        original payload begins; see is_start_code_offset() */
+    uint32_t *stc_offset;
+    unsigned int stc_offset_size; ///< allocated size of stc_offset
+    int nb_stc_offset;            ///< entries of stc_offset in use
+
     int got_keyframe;
+
+    AVSSequenceHeader sequence;
+    AVSPictureHeader picture;
 } AVSContext;
 
 extern const uint8_t     ff_cavs_chroma_qp[64];
@@ -268,19 +395,42 @@ static inline void set_mvs(cavs_vector *mv, enum cavs_block size) {
     }
 }
 
+/** replicate one partition's mv_diff over the 8x8 blocks it covers */
+static inline void set_mvds(int16_t (*mvd)[2], enum cavs_block size) {
+    switch(size) {
+    case BLK_16X16:
+        memcpy(mvd[MV_STRIDE  ], mvd[0], sizeof(*mvd));
+        memcpy(mvd[MV_STRIDE+1], mvd[0], sizeof(*mvd));
+        av_fallthrough;
+    case BLK_16X8:
+        memcpy(mvd[1], mvd[0], sizeof(*mvd));
+        break;
+    case BLK_8X16:
+        memcpy(mvd[MV_STRIDE], mvd[0], sizeof(*mvd));
+        break;
+    }
+}
+
 void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_load_intra_pred_luma(AVSContext *h, uint8_t *top, uint8_t **left,
                                   int block);
 void ff_cavs_load_intra_pred_chroma(AVSContext *h);
 void ff_cavs_modify_mb_i(AVSContext *h, int *pred_mode_uv);
-void ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type);
+int ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type);
 void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
                 enum cavs_mv_pred mode, enum cavs_block size, int ref);
 void ff_cavs_init_mb(AVSContext *h);
+void ff_cavs_set_mb_row(AVSContext *h);
 int  ff_cavs_next_mb(AVSContext *h);
 int ff_cavs_init_pic(AVSContext *h);
 int ff_cavs_init_top_lines(AVSContext *h);
+void ff_cavs_free_top_lines(AVSContext *h);
 int ff_cavs_init(AVCodecContext *avctx);
 int ff_cavs_end (AVCodecContext *avctx);
+int ff_cavs_parse_sequence_header(const uint8_t *buf, size_t size,
+                                  AVSSequenceHeader *sequence);
+int ff_cavs_parse_picture_header(const uint8_t *buf, size_t size,
+                                 const AVSSequenceHeader *sequence,
+                                 int intra, AVSPictureHeader *picture);
 
 #endif /* AVCODEC_CAVS_H */
