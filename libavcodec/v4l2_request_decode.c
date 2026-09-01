@@ -59,6 +59,8 @@ static int v4l2_request_queue_buffer(V4L2RequestContext *ctx, int request_fd,
         buffer.m.planes = planes;
     }
 
+    if (!V4L2_TYPE_IS_OUTPUT(buffer.type))
+        ctx = v4l2_request_capture_context(ctx);
     // Queue the buffer
     if (ioctl(ctx->video_fd, VIDIOC_QBUF, &buffer) < 0)
         return AVERROR(errno);
@@ -88,6 +90,8 @@ static int v4l2_request_dequeue_buffer(V4L2RequestContext *ctx,
         buffer.m.planes = planes;
     }
 
+    if (!V4L2_TYPE_IS_OUTPUT(type))
+        ctx = v4l2_request_capture_context(ctx);
     // Dequeue next completed buffer
     if (ioctl(ctx->video_fd, VIDIOC_DQBUF, &buffer) < 0)
         return AVERROR(errno);
@@ -135,10 +139,10 @@ static inline int v4l2_request_dequeue_completed_buffers(V4L2RequestContext *ctx
 int ff_v4l2_request_wait_capture(V4L2RequestContext *ctx,
                                V4L2RequestBuffer *capture, bool check_error)
 {
-    struct pollfd pollfd = {
-        .fd = ctx->video_fd,
-        .events = POLLIN,
-    };
+    struct pollfd pollfd = { .events = POLLIN };
+
+    ctx = v4l2_request_capture_context(ctx);
+    pollfd.fd = ctx->video_fd;
 
     ff_mutex_lock(&ctx->mutex);
 
@@ -285,7 +289,7 @@ static int v4l2_request_queue_decode(AVCodecContext *avctx,
          * FFmpeg may reuse an AVFrame early, i.e. when no output frame was
          * produced prior time, and a syncronization is necessary.
          */
-        ret = v4l2_request_wait_on_capture(ctx, pic->capture);
+        ret = ff_v4l2_request_wait_capture(ctx, pic->capture, false);
         if (ret < 0)
             return ret;
     }
@@ -475,9 +479,28 @@ void ff_v4l2_request_flush(AVCodecContext *avctx)
             break;
     }
 
-    // Dequeue all completed capture buffers
-    if (atomic_load(&ctx->queued_capture))
-        v4l2_request_dequeue_completed_buffers(ctx, ctx->format.type);
+    ff_mutex_unlock(&ctx->mutex);
 
+    /* Capture/VPSS can finish after OUTPUT is returned. Keep its queue
+     * state and fd valid for downstream frames through the final dequeue. */
+    ctx = v4l2_request_capture_context(ctx);
+    pollfd.fd = ctx->video_fd;
+    pollfd.events = POLLIN;
+    ff_mutex_lock(&ctx->mutex);
+    while (atomic_load(&ctx->queued_capture)) {
+        int ret = v4l2_request_dequeue_buffer(ctx, ctx->format.type);
+
+        if (ret == AVERROR(EAGAIN)) {
+            ret = poll(&pollfd, 1, 2000);
+            if (ret > 0)
+                continue;
+        } else if (!ret) {
+            continue;
+        }
+        /* Canceled or unfinished capture must never become valid pixels. */
+        atomic_fetch_or(&ctx->capture_errors,
+                        atomic_exchange(&ctx->queued_capture, 0));
+        break;
+    }
     ff_mutex_unlock(&ctx->mutex);
 }

@@ -27,11 +27,18 @@
 typedef struct V4L2RequestFrameDescriptor {
     AVDRMFrameDescriptor base;
     V4L2RequestBuffer capture;
+    V4L2RequestContext *ctx;
+    AVBufferRef *capture_ref;
 } V4L2RequestFrameDescriptor;
 
 static inline V4L2RequestContext *v4l2_request_context(AVCodecContext *avctx)
 {
     return (V4L2RequestContext *)avctx->internal->hwaccel_priv_data;
+}
+
+static inline V4L2RequestContext *v4l2_request_capture_context(V4L2RequestContext *ctx)
+{
+    return ctx->capture_ref ? (void *)ctx->capture_ref->data : ctx;
 }
 
 int ff_v4l2_request_wait_capture(V4L2RequestContext *ctx,

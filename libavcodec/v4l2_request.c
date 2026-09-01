@@ -214,6 +214,7 @@ static void v4l2_request_frame_free(void *opaque, uint8_t *data)
     V4L2RequestFrameDescriptor *desc = (V4L2RequestFrameDescriptor *)data;
 
     v4l2_request_buffer_free(&desc->capture);
+    av_buffer_unref(&desc->capture_ref);
 
     av_free(data);
 }
@@ -237,11 +238,21 @@ static AVBufferRef *v4l2_request_frame_alloc(void *opaque, size_t size)
 
     desc = (V4L2RequestFrameDescriptor *)data;
     desc->capture.fd = -1;
+    desc->ctx = ctx;
 
     // Create a V4L2 capture buffer for this AVFrame
     if (v4l2_request_buffer_alloc(ctx, &desc->capture, ctx->format.type) < 0) {
         av_buffer_unref(&ref);
         return NULL;
+    }
+
+    if (ctx->capture_ref) {
+        desc->capture_ref = av_buffer_ref(ctx->capture_ref);
+        if (!desc->capture_ref) {
+            av_buffer_unref(&ref);
+            return NULL;
+        }
+        desc->ctx = (void *)desc->capture_ref->data;
     }
 
     // Set AVDRMFrameDescriptor of this AVFrame
@@ -251,6 +262,49 @@ static AVBufferRef *v4l2_request_frame_alloc(void *opaque, size_t size)
     }
 
     return ref;
+}
+
+/*
+ * Filters can still own reordered frames after the codec has reached EOF.
+ * A separate fd/allocator outlives codec-private state through capture refs.
+ */
+static void v4l2_request_capture_context_free(void *opaque, uint8_t *data)
+{
+    V4L2RequestContext *ctx = (void *)data;
+
+    close(ctx->video_fd);
+    ff_mutex_destroy(&ctx->mutex);
+    av_free(ctx);
+}
+
+static int v4l2_request_capture_context_init(V4L2RequestContext *ctx)
+{
+    V4L2RequestContext *capture = av_mallocz(sizeof(*capture));
+
+    if (!capture)
+        return AVERROR(ENOMEM);
+    capture->av_class = &v4l2_request_context_class;
+    capture->format = ctx->format;
+    capture->video_fd = dup(ctx->video_fd);
+    if (capture->video_fd < 0 ||
+        fcntl(capture->video_fd, F_SETFD, FD_CLOEXEC) < 0) {
+        int ret = AVERROR(errno);
+
+        if (capture->video_fd >= 0)
+            close(capture->video_fd);
+        av_free(capture);
+        return ret;
+    }
+    ff_mutex_init(&capture->mutex, NULL);
+    atomic_init(&capture->queued_capture, 0);
+    atomic_init(&capture->capture_errors, 0);
+    ctx->capture_ref = av_buffer_create((uint8_t *)capture, sizeof(*capture),
+                                       v4l2_request_capture_context_free, NULL, 0);
+    if (!ctx->capture_ref) {
+        v4l2_request_capture_context_free(NULL, (uint8_t *)capture);
+        return AVERROR(ENOMEM);
+    }
+    return 0;
 }
 
 static void v4l2_request_hwframe_ctx_free(AVHWFramesContext *hwfc)
@@ -276,6 +330,13 @@ int ff_v4l2_request_frame_params(AVCodecContext *avctx,
         hwfc->width = ctx->format.fmt.pix.width;
         hwfc->height = ctx->format.fmt.pix.height;
         frames->bytesperline = ctx->format.fmt.pix.bytesperline;
+    }
+
+    if (!ctx->capture_ref) {
+        int ret = v4l2_request_capture_context_init(ctx);
+
+        if (ret < 0)
+            return ret;
     }
 
     hwfc->pool = av_buffer_pool_init2(sizeof(V4L2RequestFrameDescriptor), ctx,
@@ -330,6 +391,8 @@ int ff_v4l2_request_uninit(AVCodecContext *avctx)
         close(ctx->video_fd);
         ctx->video_fd = -1;
     }
+
+    av_buffer_unref(&ctx->capture_ref);
 
     // Ownership of media device file descriptor may belong to hwdevice
     if (ctx->device_ref) {
