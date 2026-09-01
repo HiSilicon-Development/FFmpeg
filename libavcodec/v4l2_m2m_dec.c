@@ -133,9 +133,41 @@ static int v4l2_prepare_decoder(V4L2m2mContext *s)
     return 0;
 }
 
+static int v4l2_mpeg4_set_packet_pts(AVCodecContext *avctx,
+                                     V4L2m2mPriv *priv, AVPacket *pkt)
+{
+    static const AVRational parser_timebase = { 1, 1200000 };
+    AVRational packet_timebase = avctx->pkt_timebase.num ?
+                                 avctx->pkt_timebase : avctx->time_base;
+    uint8_t *parsed_data;
+    int parsed_size;
+    int ret;
+
+    if (avctx->codec_id != AV_CODEC_ID_MPEG4 || !pkt->size)
+        return 0;
+    if (!priv->mpeg4_parser || !avctx->framerate.num ||
+        !packet_timebase.num || !packet_timebase.den)
+        return AVERROR_INVALIDDATA;
+
+    ret = av_parser_parse2(priv->mpeg4_parser, avctx,
+                           &parsed_data, &parsed_size,
+                           pkt->data, pkt->size,
+                           AV_NOPTS_VALUE, AV_NOPTS_VALUE, pkt->pos);
+    if (ret < 0)
+        return ret;
+    if (!parsed_size || priv->mpeg4_parser->pts == AV_NOPTS_VALUE)
+        return AVERROR_INVALIDDATA;
+
+    /* Stateful V4L2 copies this timestamp to the reordered CAPTURE frame. */
+    pkt->pts = av_rescale_q(priv->mpeg4_parser->pts,
+                            parser_timebase, packet_timebase);
+    return 0;
+}
+
 static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
-    V4L2m2mContext *s = ((V4L2m2mPriv*)avctx->priv_data)->context;
+    V4L2m2mPriv *priv = avctx->priv_data;
+    V4L2m2mContext *s = priv->context;
     V4L2Context *const capture = &s->capture;
     V4L2Context *const output = &s->output;
     int ret;
@@ -148,6 +180,9 @@ static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             else if (ret != AVERROR_EOF)
                 return ret;
         }
+        ret = v4l2_mpeg4_set_packet_pts(avctx, priv, &s->buf_pkt);
+        if (ret < 0)
+            return ret;
     }
 
     if (s->draining)
@@ -206,6 +241,13 @@ static av_cold int v4l2_decode_init(AVCodecContext *avctx)
     capture->av_pix_fmt = avctx->pix_fmt;
 
     s->avctx = avctx;
+    if (avctx->codec_id == AV_CODEC_ID_MPEG4) {
+        priv->mpeg4_parser = av_parser_init(AV_CODEC_ID_MPEG4);
+        if (!priv->mpeg4_parser)
+            return AVERROR(ENOMEM);
+        priv->mpeg4_parser->flags |= PARSER_FLAG_COMPLETE_FRAMES |
+                                     PARSER_FLAG_USE_CODEC_TS;
+    }
     ret = ff_v4l2_m2m_codec_init(priv);
     if (ret) {
         av_log(avctx, AV_LOG_ERROR, "can't configure decoder\n");
@@ -217,7 +259,11 @@ static av_cold int v4l2_decode_init(AVCodecContext *avctx)
 
 static av_cold int v4l2_decode_close(AVCodecContext *avctx)
 {
-    return ff_v4l2_m2m_codec_end(avctx->priv_data);
+    V4L2m2mPriv *priv = avctx->priv_data;
+
+    av_parser_close(priv->mpeg4_parser);
+    priv->mpeg4_parser = NULL;
+    return ff_v4l2_m2m_codec_end(priv);
 }
 
 #define OFFSET(x) offsetof(V4L2m2mPriv, x)
@@ -261,7 +307,7 @@ M2MDEC(h264,  "H.264", AV_CODEC_ID_H264,       "h264_mp4toannexb");
 M2MDEC(hevc,  "HEVC",  AV_CODEC_ID_HEVC,       "hevc_mp4toannexb");
 M2MDEC(mpeg1, "MPEG1", AV_CODEC_ID_MPEG1VIDEO, NULL);
 M2MDEC(mpeg2, "MPEG2", AV_CODEC_ID_MPEG2VIDEO, NULL);
-M2MDEC(mpeg4, "MPEG4", AV_CODEC_ID_MPEG4,      NULL);
+M2MDEC(mpeg4, "MPEG4", AV_CODEC_ID_MPEG4,      "mpeg4_unpack_bframes");
 M2MDEC(h263,  "H.263", AV_CODEC_ID_H263,       NULL);
 M2MDEC(vc1 ,  "VC1",   AV_CODEC_ID_VC1,        NULL);
 M2MDEC(vp8,   "VP8",   AV_CODEC_ID_VP8,        NULL);
