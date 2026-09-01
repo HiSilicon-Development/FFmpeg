@@ -3695,6 +3695,8 @@ hevc_vulkan_encoder_select="atsc_a53 cbs_h265 vulkan_encode"
 hevc_v4l2m2m_decoder_deps="v4l2_m2m hevc_v4l2_m2m"
 hevc_v4l2m2m_decoder_select="hevc_mp4toannexb_bsf"
 hevc_v4l2m2m_encoder_deps="v4l2_m2m hevc_v4l2_m2m"
+mjpeg_v4l2m2m_decoder_deps="v4l2_m2m mjpeg_v4l2_m2m"
+mjpeg_v4l2m2m_encoder_deps="v4l2_m2m mjpeg_v4l2_m2m"
 mjpeg_cuvid_decoder_deps="cuvid"
 mjpeg_qsv_decoder_select="qsvdec"
 mjpeg_qsv_encoder_deps="libmfx"
@@ -7668,6 +7670,7 @@ if enabled v4l2_m2m; then
     check_cc h264_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_H264;"
     check_cc vp8_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP8;"
     check_cc vp9_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP9;"
+    check_cc mjpeg_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_JPEG;"
 fi
 
 if enabled v4l2_request; then
