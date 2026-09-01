@@ -39,39 +39,57 @@
  */
 static int cavs_find_frame_end(ParseContext *pc, const uint8_t *buf,
                                int buf_size) {
-    int pic_found, i;
+    enum {
+        CAVS_PARSE_NONE,
+        CAVS_PARSE_PICTURE,
+        CAVS_PARSE_BOUNDARY,
+    } unit_found;
+    int i;
     uint32_t state;
 
-    pic_found= pc->frame_start_found;
-    state= pc->state;
+    unit_found = pc->frame_start_found;
+    state      = pc->state;
 
     i=0;
-    if(!pic_found){
+    if (!unit_found) {
         for(i=0; i<buf_size; i++){
             state= (state<<8) | buf[i];
             if(state == PIC_I_START_CODE || state == PIC_PB_START_CODE){
                 i++;
-                pic_found=1;
+                unit_found = CAVS_PARSE_PICTURE;
+                break;
+            }
+            if (state == CAVS_END_CODE || state == VIDEO_EDIT_START_CODE) {
+                i++;
+                unit_found = CAVS_PARSE_BOUNDARY;
                 break;
             }
         }
     }
 
-    if(pic_found){
+    if (unit_found) {
         /* EOF considered as end of frame */
         if (buf_size == 0)
             return 0;
         for(; i<buf_size; i++){
             state= (state<<8) | buf[i];
-            if (state == PIC_I_START_CODE || state == PIC_PB_START_CODE ||
-                    state == CAVS_START_CODE) {
+            if ((unit_found == CAVS_PARSE_PICTURE &&
+                 (state == PIC_I_START_CODE ||
+                  state == PIC_PB_START_CODE ||
+                  state == CAVS_START_CODE ||
+                  state == CAVS_END_CODE ||
+                  state == VIDEO_EDIT_START_CODE)) ||
+                (unit_found == CAVS_PARSE_BOUNDARY &&
+                 (state == CAVS_START_CODE ||
+                  state == PIC_I_START_CODE ||
+                  state == PIC_PB_START_CODE))) {
                 pc->frame_start_found=0;
                 pc->state=-1;
                 return i-3;
             }
         }
     }
-    pc->frame_start_found= pic_found;
+    pc->frame_start_found= unit_found;
     pc->state= state;
     return END_NOT_FOUND;
 }

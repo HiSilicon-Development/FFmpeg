@@ -32,6 +32,7 @@
 #include "idctdsp.h"
 #include "mathops.h"
 #include "qpeldsp.h"
+#include "libavutil/refstruct.h"
 #include "cavs.h"
 
 static const uint8_t alpha_tab[64] = {
@@ -57,7 +58,21 @@ static const uint8_t tc_tab[64] = {
 
 /** mark block as unavailable, i.e. out of picture
  *  or not yet decoded */
-static const cavs_vector un_mv = { 0, 0, 1, NOT_AVAIL };
+static const cavs_vector un_mv = { 0, 0, 1, NOT_AVAIL, 0 };
+
+/** Inverse block scan method 2 (clause 9.5.3 c), figure 23), for field
+    coded pictures, as the inverse ff_permute_scantable() expects. */
+static const uint8_t cavs_scan_field[64] = {
+     0,  8, 16,  1, 24, 32,  9, 17, 40, 48, 25,  2, 10, 56, 33, 18,
+     3, 41, 49, 26, 11, 19,  4, 57, 34, 12, 42, 27, 20, 50, 35, 28,
+     5, 13, 58, 43, 36, 21,  6, 29, 51, 44, 14, 22, 37, 59, 52, 30,
+    45, 60, 38, 53, 46, 61, 54,  7, 62, 15, 23, 31, 39, 47, 55, 63,
+};
+
+static inline int get_chroma_qp(const AVSContext *h, int qp, int plane)
+{
+    return ff_cavs_chroma_qp[av_clip(qp + h->chroma_qp_delta[plane], 0, 63)];
+}
 
 static const int8_t left_modifier_l[8] = {  0, -1,  6, -1, -1, 7, 6, 7 };
 static const int8_t top_modifier_l[8]  = { -1,  1,  5, -1, -1, 5, 7, 7 };
@@ -148,9 +163,13 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 qp_avg = (h->qp + h->left_qp + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_lv(h->cy, h->l_stride, alpha, beta, tc, bs[0], bs[1]);
-                qp_avg = (ff_cavs_chroma_qp[h->qp] + ff_cavs_chroma_qp[h->left_qp] + 1) >> 1;
+                qp_avg = (get_chroma_qp(h, h->qp, 0) +
+                          get_chroma_qp(h, h->left_qp, 0) + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_cv(h->cu, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
+                qp_avg = (get_chroma_qp(h, h->qp, 1) +
+                          get_chroma_qp(h, h->left_qp, 1) + 1) >> 1;
+                SET_PARAMS;
                 h->cdsp.cavs_filter_cv(h->cv, h->c_stride, alpha, beta, tc, bs[0], bs[1]);
             }
             qp_avg = h->qp;
@@ -162,9 +181,13 @@ void ff_cavs_filter(AVSContext *h, enum cavs_mb mb_type)
                 qp_avg = (h->qp + h->top_qp[h->mbx] + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_lh(h->cy, h->l_stride, alpha, beta, tc, bs[4], bs[5]);
-                qp_avg = (ff_cavs_chroma_qp[h->qp] + ff_cavs_chroma_qp[h->top_qp[h->mbx]] + 1) >> 1;
+                qp_avg = (get_chroma_qp(h, h->qp, 0) +
+                          get_chroma_qp(h, h->top_qp[h->mbx], 0) + 1) >> 1;
                 SET_PARAMS;
                 h->cdsp.cavs_filter_ch(h->cu, h->c_stride, alpha, beta, tc, bs[4], bs[5]);
+                qp_avg = (get_chroma_qp(h, h->qp, 1) +
+                          get_chroma_qp(h, h->top_qp[h->mbx], 1) + 1) >> 1;
+                SET_PARAMS;
                 h->cdsp.cavs_filter_ch(h->cv, h->c_stride, alpha, beta, tc, bs[4], bs[5]);
             }
         }
@@ -386,8 +409,8 @@ void ff_cavs_modify_mb_i(AVSContext *h, int *pred_mode_uv)
  *
  ****************************************************************************/
 
-static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int chroma_height,
-                               int list, uint8_t *dest_y,
+static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int parity,
+                               int chroma_height, int list, uint8_t *dest_y,
                                uint8_t *dest_cb, uint8_t *dest_cr,
                                int src_x_offset, int src_y_offset,
                                qpel_mc_func *qpix_op,
@@ -396,19 +419,26 @@ static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int chroma_height,
     const int mx         = mv->x + src_x_offset * 8;
     const int my         = mv->y + src_y_offset * 8;
     const int luma_xy    = (mx & 3) + ((my & 3) << 2);
-    uint8_t *src_y       = pic->data[0] + (mx >> 2) + (my >> 2) * h->l_stride;
-    uint8_t *src_cb      = pic->data[1] + (mx >> 3) + (my >> 3) * h->c_stride;
-    uint8_t *src_cr      = pic->data[2] + (mx >> 3) + (my >> 3) * h->c_stride;
+    uint8_t *src_y, *src_cb, *src_cr;
     int extra_width      = 0;
     int extra_height     = extra_width;
     const int full_mx    = mx >> 2;
     const int full_my    = my >> 2;
     const int pic_width  = 16 * h->mb_width;
-    const int pic_height = 16 * h->mb_height;
+    /* motion vectors address a field in quarter field lines (9.9.2.1) */
+    const int pic_height = h->pic_structure ? 16 * h->mb_height
+                                            :  8 * h->mb_height;
     int emu = 0;
 
     if (!pic->data[0])
         return;
+    src_y  = pic->data[0] + parity * pic->linesize[0] +
+             (mx >> 2) + (my >> 2) * h->l_stride;
+    src_cb = pic->data[1] + parity * pic->linesize[1] +
+             (mx >> 3) + (my >> 3) * h->c_stride;
+    src_cr = pic->data[2] + parity * pic->linesize[2] +
+             (mx >> 3) + (my >> 3) * h->c_stride;
+
     if (mx & 7)
         extra_width  -= 3;
     if (my & 7)
@@ -452,78 +482,194 @@ static inline void mc_dir_part(AVSContext *h, AVFrame *pic, int chroma_height,
     chroma_op(dest_cr, src_cr, h->c_stride, chroma_height, mx & 7, my & 7);
 }
 
-static inline void mc_part_std(AVSContext *h, int chroma_height,
-                               uint8_t *dest_y,
-                               uint8_t *dest_cb,
-                               uint8_t *dest_cr,
-                               int x_offset, int y_offset,
-                               qpel_mc_func *qpix_put,
-                               h264_chroma_mc_func chroma_put,
-                               qpel_mc_func *qpix_avg,
-                               h264_chroma_mc_func chroma_avg,
-                               cavs_vector *mv)
+static void weight_plane(uint8_t *dst, ptrdiff_t stride, int width, int height,
+                         int scale, int shift)
+{
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++)
+            dst[x] = ff_cavs_weight_sample(dst[x], scale, shift);
+        dst += stride;
+    }
+}
+
+static void copy_plane(uint8_t *dst, ptrdiff_t dst_stride,
+                       const uint8_t *src, ptrdiff_t src_stride,
+                       int width, int height)
+{
+    for (int y = 0; y < height; y++) {
+        memcpy(dst, src, width);
+        dst += dst_stride;
+        src += src_stride;
+    }
+}
+
+static void average_plane(uint8_t *dst, ptrdiff_t dst_stride,
+                          const uint8_t *src, ptrdiff_t src_stride,
+                          int width, int height)
+{
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++)
+            dst[x] = (dst[x] + src[x] + 1) >> 1;
+        dst += dst_stride;
+        src += src_stride;
+    }
+}
+
+/** Apply the slice weight for one prediction direction (clause 9.9.3). */
+static int weight_prediction(AVSContext *h, uint8_t *dest_y,
+                             uint8_t *dest_cb, uint8_t *dest_cr,
+                             int chroma_height, const cavs_vector *mv,
+                             int list)
+{
+    int index = ff_cavs_weight_index(h->cur.f->pict_type, mv->ref,
+                                     h->ref_base[list], list);
+
+    if ((unsigned)index >= FF_ARRAY_ELEMS(h->luma_scale)) {
+        av_log(h->avctx, AV_LOG_ERROR,
+               "weighted reference index %d out of range\n", index);
+        return AVERROR_INVALIDDATA;
+    }
+
+    weight_plane(dest_y, h->l_stride, 2 * chroma_height, 2 * chroma_height,
+                 h->luma_scale[index], h->luma_shift[index]);
+    weight_plane(dest_cb, h->c_stride, chroma_height, chroma_height,
+                 h->chroma_scale[index], h->chroma_shift[index]);
+    weight_plane(dest_cr, h->c_stride, chroma_height, chroma_height,
+                 h->chroma_scale[index], h->chroma_shift[index]);
+    return 0;
+}
+
+static inline int mc_part_std(AVSContext *h, int chroma_height,
+                              uint8_t *dest_y,
+                              uint8_t *dest_cb,
+                              uint8_t *dest_cr,
+                              int x_offset, int y_offset,
+                              qpel_mc_func *qpix_put,
+                              h264_chroma_mc_func chroma_put,
+                              qpel_mc_func *qpix_avg,
+                              h264_chroma_mc_func chroma_avg,
+                              cavs_vector *mv)
 {
     qpel_mc_func *qpix_op =  qpix_put;
     h264_chroma_mc_func chroma_op = chroma_put;
+    cavs_vector *mv_fwd = mv;
+    cavs_vector *mv_bwd = mv + MV_BWD_OFFS;
+    int ret;
 
     dest_y   += x_offset * 2 + y_offset * h->l_stride * 2;
     dest_cb  += x_offset     + y_offset * h->c_stride;
     dest_cr  += x_offset     + y_offset * h->c_stride;
     x_offset += 8 * h->mbx;
-    y_offset += 8 * h->mby;
+    /* the row is counted inside the current field (clause 3.24) */
+    y_offset += 8 * h->field_mby;
 
-    if (mv->ref >= 0) {
-        AVFrame *ref = h->DPB[mv->ref].f;
-        mc_dir_part(h, ref, chroma_height, 0,
-                    dest_y, dest_cb, dest_cr, x_offset, y_offset,
-                    qpix_op, chroma_op, mv);
+    if (!h->weighting_prediction) {
+        if (mv_fwd->ref >= 0) {
+            mc_dir_part(h, h->ref[mv_fwd->ref].f,
+                        h->ref[mv_fwd->ref].parity,
+                        chroma_height, 0,
+                        dest_y, dest_cb, dest_cr, x_offset, y_offset,
+                        qpix_op, chroma_op, mv_fwd);
 
-        qpix_op   = qpix_avg;
-        chroma_op = chroma_avg;
+            qpix_op   = qpix_avg;
+            chroma_op = chroma_avg;
+        }
+        if (mv_bwd->ref >= 0)
+            mc_dir_part(h, h->ref[mv_bwd->ref].f,
+                        h->ref[mv_bwd->ref].parity,
+                        chroma_height, 1,
+                        dest_y, dest_cb, dest_cr, x_offset, y_offset,
+                        qpix_op, chroma_op, mv_bwd);
+        return 0;
     }
 
-    if ((mv + MV_BWD_OFFS)->ref >= 0) {
-        AVFrame *ref = h->DPB[0].f;
-        mc_dir_part(h, ref, chroma_height, 1,
+    if (mv_fwd->ref >= 0) {
+        mc_dir_part(h, h->ref[mv_fwd->ref].f, h->ref[mv_fwd->ref].parity,
+                    chroma_height, 0,
                     dest_y, dest_cb, dest_cr, x_offset, y_offset,
-                    qpix_op, chroma_op, mv + MV_BWD_OFFS);
+                    qpix_put, chroma_put, mv_fwd);
+        ret = weight_prediction(h, dest_y, dest_cb, dest_cr, chroma_height,
+                                mv_fwd, 0);
+        if (ret < 0)
+            return ret;
     }
+
+    if (mv_bwd->ref >= 0) {
+        DECLARE_ALIGNED(16, uint8_t, tmp_y)[16 * 16];
+        DECLARE_ALIGNED(16, uint8_t, tmp_cb)[8 * 8];
+        DECLARE_ALIGNED(16, uint8_t, tmp_cr)[8 * 8];
+        int bidirectional = mv_fwd->ref >= 0;
+
+        if (bidirectional) {
+            copy_plane(tmp_y, 16, dest_y, h->l_stride,
+                       2 * chroma_height, 2 * chroma_height);
+            copy_plane(tmp_cb, 8, dest_cb, h->c_stride,
+                       chroma_height, chroma_height);
+            copy_plane(tmp_cr, 8, dest_cr, h->c_stride,
+                       chroma_height, chroma_height);
+        }
+        mc_dir_part(h, h->ref[mv_bwd->ref].f, h->ref[mv_bwd->ref].parity,
+                    chroma_height, 1,
+                    dest_y, dest_cb, dest_cr, x_offset, y_offset,
+                    qpix_put, chroma_put, mv_bwd);
+        ret = weight_prediction(h, dest_y, dest_cb, dest_cr, chroma_height,
+                                mv_bwd, 1);
+        if (ret < 0)
+            return ret;
+        if (bidirectional) {
+            average_plane(dest_y, h->l_stride, tmp_y, 16,
+                          2 * chroma_height, 2 * chroma_height);
+            average_plane(dest_cb, h->c_stride, tmp_cb, 8,
+                          chroma_height, chroma_height);
+            average_plane(dest_cr, h->c_stride, tmp_cr, 8,
+                          chroma_height, chroma_height);
+        }
+    }
+    return 0;
 }
 
-void ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type)
+int ff_cavs_inter(AVSContext *h, enum cavs_mb mb_type)
 {
     if (ff_cavs_partition_flags[mb_type] == 0) { // 16x16
-        mc_part_std(h, 8, h->cy, h->cu, h->cv, 0, 0,
-                    h->cdsp.put_cavs_qpel_pixels_tab[0],
-                    h->h264chroma.put_h264_chroma_pixels_tab[0],
-                    h->cdsp.avg_cavs_qpel_pixels_tab[0],
-                    h->h264chroma.avg_h264_chroma_pixels_tab[0],
-                    &h->mv[MV_FWD_X0]);
+        return mc_part_std(h, 8, h->cy, h->cu, h->cv, 0, 0,
+                           h->cdsp.put_cavs_qpel_pixels_tab[0],
+                           h->h264chroma.put_h264_chroma_pixels_tab[0],
+                           h->cdsp.avg_cavs_qpel_pixels_tab[0],
+                           h->h264chroma.avg_h264_chroma_pixels_tab[0],
+                           &h->mv[MV_FWD_X0]);
     } else {
-        mc_part_std(h, 4, h->cy, h->cu, h->cv, 0, 0,
-                    h->cdsp.put_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.put_h264_chroma_pixels_tab[1],
-                    h->cdsp.avg_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.avg_h264_chroma_pixels_tab[1],
-                    &h->mv[MV_FWD_X0]);
-        mc_part_std(h, 4, h->cy, h->cu, h->cv, 4, 0,
-                    h->cdsp.put_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.put_h264_chroma_pixels_tab[1],
-                    h->cdsp.avg_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.avg_h264_chroma_pixels_tab[1],
-                    &h->mv[MV_FWD_X1]);
-        mc_part_std(h, 4, h->cy, h->cu, h->cv, 0, 4,
-                    h->cdsp.put_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.put_h264_chroma_pixels_tab[1],
-                    h->cdsp.avg_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.avg_h264_chroma_pixels_tab[1],
-                    &h->mv[MV_FWD_X2]);
-        mc_part_std(h, 4, h->cy, h->cu, h->cv, 4, 4,
-                    h->cdsp.put_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.put_h264_chroma_pixels_tab[1],
-                    h->cdsp.avg_cavs_qpel_pixels_tab[1],
-                    h->h264chroma.avg_h264_chroma_pixels_tab[1],
-                    &h->mv[MV_FWD_X3]);
+        int ret;
+
+        ret = mc_part_std(h, 4, h->cy, h->cu, h->cv, 0, 0,
+                          h->cdsp.put_cavs_qpel_pixels_tab[1],
+                          h->h264chroma.put_h264_chroma_pixels_tab[1],
+                          h->cdsp.avg_cavs_qpel_pixels_tab[1],
+                          h->h264chroma.avg_h264_chroma_pixels_tab[1],
+                          &h->mv[MV_FWD_X0]);
+        if (ret < 0)
+            return ret;
+        ret = mc_part_std(h, 4, h->cy, h->cu, h->cv, 4, 0,
+                          h->cdsp.put_cavs_qpel_pixels_tab[1],
+                          h->h264chroma.put_h264_chroma_pixels_tab[1],
+                          h->cdsp.avg_cavs_qpel_pixels_tab[1],
+                          h->h264chroma.avg_h264_chroma_pixels_tab[1],
+                          &h->mv[MV_FWD_X1]);
+        if (ret < 0)
+            return ret;
+        ret = mc_part_std(h, 4, h->cy, h->cu, h->cv, 0, 4,
+                          h->cdsp.put_cavs_qpel_pixels_tab[1],
+                          h->h264chroma.put_h264_chroma_pixels_tab[1],
+                          h->cdsp.avg_cavs_qpel_pixels_tab[1],
+                          h->h264chroma.avg_h264_chroma_pixels_tab[1],
+                          &h->mv[MV_FWD_X2]);
+        if (ret < 0)
+            return ret;
+        return mc_part_std(h, 4, h->cy, h->cu, h->cv, 4, 4,
+                           h->cdsp.put_cavs_qpel_pixels_tab[1],
+                           h->h264chroma.put_h264_chroma_pixels_tab[1],
+                           h->cdsp.avg_cavs_qpel_pixels_tab[1],
+                           h->h264chroma.avg_h264_chroma_pixels_tab[1],
+                           &h->mv[MV_FWD_X3]);
     }
 }
 
@@ -582,13 +728,16 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
 
     mvP->ref  = ref;
     mvP->dist = h->dist[mvP->ref];
+    /* a derived reference has index 0 (clause 9.4.5) */
+    if (mode >= MV_PRED_PSKIP)
+        mvP->ref_idx = 0;
     if (mvC->ref == NOT_AVAIL || (nP == MV_FWD_X3) || (nP == MV_BWD_X3 ))
         mvC = &h->mv[nP - 5];  // set to top-left (mvD)
     if (mode == MV_PRED_PSKIP &&
         (mvA->ref == NOT_AVAIL ||
          mvB->ref == NOT_AVAIL ||
-         (mvA->x | mvA->y | mvA->ref) == 0 ||
-         (mvB->x | mvB->y | mvB->ref) == 0)) {
+         ((mvA->x | mvA->y) == 0 && mvA->ref == ref) ||
+         ((mvB->x | mvB->y) == 0 && mvB->ref == ref))) {
         mvP2 = &un_mv;
     /* if there is only one suitable candidate, take it */
     } else if (mvA->ref >= 0 && mvB->ref < 0  && mvC->ref < 0) {
@@ -611,8 +760,21 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
         mv_pred_median(h, mvP, mvA, mvB, mvC);
 
     if (mode < MV_PRED_PSKIP) {
-        int mx = get_se_golomb(&h->gb) + (unsigned)mvP->x;
-        int my = get_se_golomb(&h->gb) + (unsigned)mvP->y;
+        int dx, dy, mx, my;
+
+        /* under AEC the caller has already decoded mv_diff into the
+         * cache (see aec_mv() in cavsdec.c) */
+        if (h->aec_enable) {
+            dx = h->mvd[nP][0];
+            dy = h->mvd[nP][1];
+        } else {
+            dx = get_se_golomb(&h->gb);
+            dy = get_se_golomb(&h->gb);
+            h->mvd[nP][0] = dx;
+            h->mvd[nP][1] = dy;
+        }
+        mx = dx + (unsigned)mvP->x;
+        my = dy + (unsigned)mvP->y;
 
         if (mx != (int16_t)mx || my != (int16_t)my) {
             av_log(h->avctx, AV_LOG_ERROR, "MV %d %d out of supported range\n", mx, my);
@@ -620,6 +782,7 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
             mvP->x = mx;
             mvP->y = my;
         }
+        set_mvds(&h->mvd[nP], size);
     }
     set_mvs(mvP, size);
 }
@@ -631,12 +794,39 @@ void ff_cavs_mv(AVSContext *h, enum cavs_mv_loc nP, enum cavs_mv_loc nC,
  ****************************************************************************/
 
 /**
+ * Point the macroblock sample pointers at macroblock row h->mby: a
+ * macroblock is addressed inside its own field, from the field's first
+ * line, at the doubled stride (clauses 3.24, 7.2.3.1).
+ */
+void ff_cavs_set_mb_row(AVSContext *h)
+{
+    int parity = 0;
+
+    h->field     = !h->pic_structure && h->mby >= h->mb_height / 2;
+    h->field_mby = h->mby - h->field * (h->mb_height / 2);
+    if (!h->pic_structure)
+        parity = h->field ^ !h->top_field_first;
+
+    h->cy = h->cur.f->data[0] + parity * h->cur.f->linesize[0] +
+            h->field_mby * 16 * h->l_stride;
+    h->cu = h->cur.f->data[1] + parity * h->cur.f->linesize[1] +
+            h->field_mby *  8 * h->c_stride;
+    h->cv = h->cur.f->data[2] + parity * h->cur.f->linesize[2] +
+            h->field_mby *  8 * h->c_stride;
+}
+
+/**
  * initialise predictors for motion vectors and intra prediction
  */
 void ff_cavs_init_mb(AVSContext *h)
 {
     int i;
 
+    /* a macroblock has no mv_diff until one is decoded for it */
+    memset(h->mvd[MV_FWD_X0], 0, 2 * sizeof(*h->mvd));
+    memset(h->mvd[MV_FWD_X2], 0, 2 * sizeof(*h->mvd));
+    memset(h->mvd[MV_BWD_X0], 0, 2 * sizeof(*h->mvd));
+    memset(h->mvd[MV_BWD_X2], 0, 2 * sizeof(*h->mvd));
     /* copy predictors from top line (MB B and C) into cache */
     for (i = 0; i < 3; i++) {
         h->mv[MV_FWD_B2 + i] = h->top_mv[0][h->mbx * 2 + i];
@@ -683,8 +873,10 @@ int ff_cavs_next_mb(AVSContext *h)
     h->cu    += 8;
     h->cv    += 8;
     /* copy mvs as predictors to the left */
-    for (i = 0; i <= 20; i += 4)
+    for (i = 0; i <= 20; i += 4) {
         h->mv[i] = h->mv[i + 2];
+        memcpy(h->mvd[i], h->mvd[i + 2], sizeof(*h->mvd));
+    }
     /* copy bottom mvs from cache to top line */
     h->top_mv[0][h->mbx * 2 + 0] = h->mv[MV_FWD_X2];
     h->top_mv[0][h->mbx * 2 + 1] = h->mv[MV_FWD_X3];
@@ -698,17 +890,17 @@ int ff_cavs_next_mb(AVSContext *h)
         /* clear left pred_modes */
         h->pred_mode_Y[3] = h->pred_mode_Y[6] = NOT_AVAIL;
         /* clear left mv predictors */
-        for (i = 0; i <= 20; i += 4)
+        for (i = 0; i <= 20; i += 4) {
             h->mv[i] = un_mv;
+            memset(h->mvd[i], 0, sizeof(*h->mvd));
+        }
         h->mbx = 0;
         h->mby++;
-        /* re-calculate sample pointers */
-        h->cy = h->cur.f->data[0] + h->mby * 16 * h->l_stride;
-        h->cu = h->cur.f->data[1] + h->mby * 8 * h->c_stride;
-        h->cv = h->cur.f->data[2] + h->mby * 8 * h->c_stride;
         if (h->mby == h->mb_height) { // Frame end
             return 0;
         }
+        /* re-calculate sample pointers */
+        ff_cavs_set_mb_row(h);
     }
     return 1;
 }
@@ -724,22 +916,23 @@ int ff_cavs_init_pic(AVSContext *h)
     int i;
 
     /* clear some predictors */
-    for (i = 0; i <= 20; i += 4)
+    for (i = 0; i <= 20; i += 4) {
         h->mv[i] = un_mv;
+        memset(h->mvd[i], 0, sizeof(*h->mvd));
+    }
     h->mv[MV_BWD_X0] = ff_cavs_dir_mv;
     set_mvs(&h->mv[MV_BWD_X0], BLK_16X16);
     h->mv[MV_FWD_X0] = ff_cavs_dir_mv;
     set_mvs(&h->mv[MV_FWD_X0], BLK_16X16);
     h->pred_mode_Y[3] = h->pred_mode_Y[6] = NOT_AVAIL;
-    h->cy             = h->cur.f->data[0];
-    h->cu             = h->cur.f->data[1];
-    h->cv             = h->cur.f->data[2];
-    h->l_stride       = h->cur.f->linesize[0];
-    h->c_stride       = h->cur.f->linesize[1];
+    /* a field is every other line of the frame (clause 6.1.2) */
+    h->l_stride       = h->cur.f->linesize[0] << !h->pic_structure;
+    h->c_stride       = h->cur.f->linesize[1] << !h->pic_structure;
     h->luma_scan[2]   = 8 * h->l_stride;
     h->luma_scan[3]   = 8 * h->l_stride + 8;
     h->mbx            = h->mby = h->mbidx = 0;
     h->flags          = 0;
+    ff_cavs_set_mb_row(h);
 
     return 0;
 }
@@ -762,6 +955,9 @@ int ff_cavs_init_top_lines(AVSContext *h)
     h->top_mv[0]    = av_calloc(h->mb_width * 2 + 1,  sizeof(cavs_vector));
     h->top_mv[1]    = av_calloc(h->mb_width * 2 + 1,  sizeof(cavs_vector));
     h->top_pred_Y   = av_calloc(h->mb_width * 2,  sizeof(*h->top_pred_Y));
+    h->top_cbp      = av_mallocz(h->mb_width);
+    h->top_c_pred_mode = av_mallocz(h->mb_width);
+    h->top_mb_type  = av_mallocz(h->mb_width);
     h->top_border_y = av_calloc(h->mb_width + 1,  16);
     h->top_border_u = av_calloc(h->mb_width,  10);
     h->top_border_v = av_calloc(h->mb_width,  10);
@@ -772,20 +968,29 @@ int ff_cavs_init_top_lines(AVSContext *h)
     h->col_type_base = av_mallocz(h->mb_width * h->mb_height);
 
     if (!h->top_qp || !h->top_mv[0] || !h->top_mv[1] || !h->top_pred_Y ||
+        !h->top_cbp || !h->top_c_pred_mode || !h->top_mb_type ||
         !h->top_border_y || !h->top_border_u || !h->top_border_v ||
         !h->col_mv || !h->col_type_base) {
-        av_freep(&h->top_qp);
-        av_freep(&h->top_mv[0]);
-        av_freep(&h->top_mv[1]);
-        av_freep(&h->top_pred_Y);
-        av_freep(&h->top_border_y);
-        av_freep(&h->top_border_u);
-        av_freep(&h->top_border_v);
-        av_freep(&h->col_mv);
-        av_freep(&h->col_type_base);
+        ff_cavs_free_top_lines(h);
         return AVERROR(ENOMEM);
     }
     return 0;
+}
+
+void ff_cavs_free_top_lines(AVSContext *h)
+{
+    av_freep(&h->top_qp);
+    av_freep(&h->top_cbp);
+    av_freep(&h->top_c_pred_mode);
+    av_freep(&h->top_mb_type);
+    av_freep(&h->top_mv[0]);
+    av_freep(&h->top_mv[1]);
+    av_freep(&h->top_pred_Y);
+    av_freep(&h->top_border_y);
+    av_freep(&h->top_border_u);
+    av_freep(&h->top_border_v);
+    av_freep(&h->col_mv);
+    av_freep(&h->col_type_base);
 }
 
 av_cold int ff_cavs_init(AVCodecContext *avctx)
@@ -799,14 +1004,23 @@ av_cold int ff_cavs_init(AVCodecContext *avctx)
     ff_cavsdsp_init(&h->cdsp);
     ff_init_scantable_permutation(permutation, h->cdsp.idct_perm);
     ff_permute_scantable(h->permutated_scantable, ff_zigzag_direct, permutation);
+    ff_permute_scantable(h->permutated_scantable_field, cavs_scan_field,
+                         permutation);
+    h->scantable = h->permutated_scantable;
+    memcpy(h->weighting_scantable, ff_zigzag_direct,
+           sizeof(h->weighting_scantable));
+    memcpy(h->weighting_scantable_field, cavs_scan_field,
+           sizeof(h->weighting_scantable_field));
+    h->weighting_scan = h->weighting_scantable;
 
     h->avctx       = avctx;
-    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
+    avctx->pix_fmt = AV_PIX_FMT_NONE;
 
     h->cur.f    = av_frame_alloc();
     h->DPB[0].f = av_frame_alloc();
     h->DPB[1].f = av_frame_alloc();
-    if (!h->cur.f || !h->DPB[0].f || !h->DPB[1].f)
+    h->DPB[2].f = av_frame_alloc();
+    if (!h->cur.f || !h->DPB[0].f || !h->DPB[1].f || !h->DPB[2].f)
         return AVERROR(ENOMEM);
 
     h->luma_scan[0]                     = 0;
@@ -835,19 +1049,18 @@ av_cold int ff_cavs_end(AVCodecContext *avctx)
 {
     AVSContext *h = avctx->priv_data;
 
+    av_refstruct_unref(&h->cur.hwaccel_picture_private);
     av_frame_free(&h->cur.f);
-    av_frame_free(&h->DPB[0].f);
-    av_frame_free(&h->DPB[1].f);
+    for (int i = 0; i < FF_ARRAY_ELEMS(h->DPB); i++) {
+        av_refstruct_unref(&h->DPB[i].hwaccel_picture_private);
+        av_frame_free(&h->DPB[i].f);
+    }
 
-    av_freep(&h->top_qp);
-    av_freep(&h->top_mv[0]);
-    av_freep(&h->top_mv[1]);
-    av_freep(&h->top_pred_Y);
-    av_freep(&h->top_border_y);
-    av_freep(&h->top_border_u);
-    av_freep(&h->top_border_v);
-    av_freep(&h->col_mv);
-    av_freep(&h->col_type_base);
+    ff_cavs_free_top_lines(h);
     av_freep(&h->edge_emu_buffer);
+    av_freep(&h->deemulated_buf);
+    h->deemulated_buf_size = 0;
+    av_freep(&h->stc_offset);
+    h->stc_offset_size = 0;
     return 0;
 }

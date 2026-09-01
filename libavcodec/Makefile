@@ -305,7 +305,7 @@ OBJS-$(CONFIG_BONK_DECODER)            += bonk.o
 OBJS-$(CONFIG_BRENDER_PIX_DECODER)     += brenderpix.o
 OBJS-$(CONFIG_C93_DECODER)             += c93.o
 OBJS-$(CONFIG_CAVS_DECODER)            += cavs.o cavsdec.o cavsdsp.o \
-                                          cavsdata.o
+                                          cavsdata.o cavs_aec.o cavs_parse.o
 OBJS-$(CONFIG_CBD2_DPCM_DECODER)       += dpcm.o
 OBJS-$(CONFIG_CCAPTION_DECODER)        += ccaption_dec.o ass.o
 OBJS-$(CONFIG_CDGRAPHICS_DECODER)      += cdgraphics.o
@@ -1378,6 +1378,10 @@ TESTPROGS = avcodec                                                     \
 TESTPROGS-$(CONFIG_APV_DECODER)           += apv
 TESTPROGS-$(CONFIG_AV1_VAAPI_ENCODER)     += av1_levels
 TESTPROGS-$(CONFIG_CABAC)                 += cabac
+TESTPROGS-$(CONFIG_CAVS_DECODER)          += cavs_aec
+TESTPROGS-$(CONFIG_CAVS_DECODER)          += cavs_parse
+TESTPROGS-$(CONFIG_CAVS_DECODER)          += cavs_parser
+TESTPROGS-$(CONFIG_CAVS_DECODER)          += cavs_weight
 TESTPROGS-$(CONFIG_CELP_MATH)             += celp_math
 TESTPROGS-$(CONFIG_GOLOMB)                += golomb
 TESTPROGS-$(CONFIG_IDCTDSP)               += dct

@@ -197,6 +197,9 @@
 #define AV_PROFILE_EVC_BASELINE             0
 #define AV_PROFILE_EVC_MAIN                 1
 
+#define AV_PROFILE_CAVS_JIZHUN              0x20
+#define AV_PROFILE_CAVS_GUANGDIAN           0x48
+
 #define AV_PROFILE_APV_422_10  33
 #define AV_PROFILE_APV_422_12  44
 #define AV_PROFILE_APV_444_10  55

@@ -28,6 +28,26 @@ fate-cabac: libavcodec/tests/cabac$(EXESUF)
 fate-cabac: CMD = run libavcodec/tests/cabac$(EXESUF)
 fate-cabac: CMP = null
 
+FATE_LIBAVCODEC-$(CONFIG_CAVS_DECODER) += fate-cavs-aec
+fate-cavs-aec: libavcodec/tests/cavs_aec$(EXESUF)
+fate-cavs-aec: CMD = run libavcodec/tests/cavs_aec$(EXESUF)
+fate-cavs-aec: CMP = null
+
+FATE_LIBAVCODEC-$(CONFIG_CAVS_DECODER) += fate-cavs-parse
+fate-cavs-parse: libavcodec/tests/cavs_parse$(EXESUF)
+fate-cavs-parse: CMD = run libavcodec/tests/cavs_parse$(EXESUF)
+fate-cavs-parse: CMP = null
+
+FATE_LIBAVCODEC-$(CONFIG_CAVS_DECODER) += fate-cavs-parser
+fate-cavs-parser: libavcodec/tests/cavs_parser$(EXESUF)
+fate-cavs-parser: CMD = run libavcodec/tests/cavs_parser$(EXESUF)
+fate-cavs-parser: CMP = null
+
+FATE_LIBAVCODEC-$(CONFIG_CAVS_DECODER) += fate-cavs-weight
+fate-cavs-weight: libavcodec/tests/cavs_weight$(EXESUF)
+fate-cavs-weight: CMD = run libavcodec/tests/cavs_weight$(EXESUF)
+fate-cavs-weight: CMP = null
+
 FATE_LIBAVCODEC-$(CONFIG_CELP_MATH) += fate-celp_math
 fate-celp_math: libavcodec/tests/celp_math$(EXESUF)
 fate-celp_math: CMD = run libavcodec/tests/celp_math$(EXESUF)
