@@ -439,6 +439,10 @@ enum AVPixelFormat {
      */
     AV_PIX_FMT_D3D12,
 
+    AV_PIX_FMT_NV15,        ///< packed planar YUV 4:2:0, 10-bit samples
+    AV_PIX_FMT_NV20BS,      ///< packed planar YUV 4:2:2, 10-bit samples
+    AV_PIX_FMT_NV30,        ///< packed planar YUV 4:4:4, 10-bit samples
+
     AV_PIX_FMT_AYUV,        ///< packed AYUV 4:4:4:4, 32bpp (1 Cr & Cb sample per 1x1 Y & A samples), AYUVAYUV...
 
     AV_PIX_FMT_UYVA,        ///< packed UYVA 4:4:4:4, 32bpp (1 Cr & Cb sample per 1x1 Y & A samples), UYVAUYVA...
