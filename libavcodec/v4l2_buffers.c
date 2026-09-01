@@ -296,26 +296,145 @@ static int v4l2_buf_to_bufref(V4L2Buffer *in, int plane, AVBufferRef **buf)
     return ret;
 }
 
-static int v4l2_bufref_to_buf(V4L2Buffer *out, int plane, const uint8_t* data, int size, int offset)
+static int v4l2_bufref_to_buf(V4L2Buffer *out, int plane, const uint8_t *data,
+                              size_t size, size_t offset)
 {
-    unsigned int bytesused, length;
+    size_t length;
 
-    if (plane >= out->num_planes)
+    if (plane < 0 || plane >= out->num_planes || (!data && size))
         return AVERROR(EINVAL);
 
     length = out->plane_info[plane].length;
-    bytesused = FFMIN(size+offset, length);
-
-    memcpy((uint8_t*)out->plane_info[plane].mm_addr+offset, data, FFMIN(size, length-offset));
+    if (length > UINT32_MAX)
+        return AVERROR(EINVAL);
+    if (offset > length || size > length - offset)
+        return AVERROR(ENOSPC);
+    if (size)
+        memcpy((uint8_t *)out->plane_info[plane].mm_addr + offset, data, size);
 
     if (V4L2_TYPE_IS_MULTIPLANAR(out->buf.type)) {
-        out->planes[plane].bytesused = bytesused;
+        out->planes[plane].bytesused = offset + size;
         out->planes[plane].length = length;
     } else {
-        out->buf.bytesused = bytesused;
+        out->buf.bytesused = offset + size;
         out->buf.length = length;
     }
 
+    return 0;
+}
+
+static int v4l2_frame_plane_bounds(const AVFrame *frame, int plane,
+                                   size_t row_bytes, unsigned int rows)
+{
+    const AVBufferRef *buf;
+    uintptr_t buf_addr, data_addr, first_addr;
+    size_t abs_stride, back, offset, span;
+    int stride;
+
+    if (plane < 0 || plane >= AV_NUM_DATA_POINTERS || !rows || !row_bytes ||
+        !frame->data[plane])
+        return AVERROR(EINVAL);
+
+    stride = frame->linesize[plane];
+    abs_stride = stride < 0 ? -(int64_t)stride : stride;
+    if (abs_stride < row_bytes || rows - 1 > (SIZE_MAX - row_bytes) / abs_stride)
+        return AVERROR(EINVAL);
+
+    back = (size_t)(rows - 1) * abs_stride;
+    span = back + row_bytes;
+    if (back > PTRDIFF_MAX || span > PTRDIFF_MAX)
+        return AVERROR(EINVAL);
+
+    buf = av_frame_get_plane_buffer(frame, plane);
+    if (!buf)
+        return AVERROR(EINVAL);
+
+    data_addr = (uintptr_t)frame->data[plane];
+    if (stride < 0 && back > data_addr)
+        return AVERROR(EINVAL);
+    first_addr = stride < 0 ? data_addr - back : data_addr;
+    buf_addr = (uintptr_t)buf->data;
+    if (first_addr < buf_addr)
+        return AVERROR(EINVAL);
+
+    offset = first_addr - buf_addr;
+    if (offset > buf->size || span > buf->size - offset)
+        return AVERROR(EINVAL);
+
+    return 0;
+}
+
+static int v4l2_buffer_swframe_nv12_to_buf(const AVFrame *frame,
+                                            V4L2Buffer *out,
+                                            uint32_t pixel_format)
+{
+    const struct v4l2_pix_format *pix = &out->context->format.fmt.pix;
+    uint8_t *dst = out->plane_info[0].mm_addr;
+    unsigned int src_width, src_height, src_chroma_rows;
+    unsigned int dst_width = pix->width;
+    unsigned int dst_height = pix->height;
+    unsigned int dst_chroma_rows;
+    size_t src_chroma_width, dst_chroma_width;
+    size_t dst_stride, luma_size, image_size;
+    unsigned int y;
+    int ret;
+
+    if (out->num_planes != 1 ||
+        frame->format != (pixel_format == V4L2_PIX_FMT_NV12 ?
+                         AV_PIX_FMT_NV12 : AV_PIX_FMT_NV21) ||
+        frame->width <= 0 || frame->height <= 0 ||
+        frame->width != out->context->width ||
+        frame->height != out->context->height)
+        return AVERROR(EINVAL);
+
+    src_width = frame->width;
+    src_height = frame->height;
+    if (!dst_width || !dst_height || src_width > dst_width ||
+        src_height > dst_height)
+        return AVERROR(EINVAL);
+
+    src_chroma_width = (size_t)src_width + (src_width & 1);
+    dst_chroma_width = (size_t)dst_width + (dst_width & 1);
+    src_chroma_rows = (src_height >> 1) + (src_height & 1);
+    dst_chroma_rows = (dst_height >> 1) + (dst_height & 1);
+    if (!dst || out->plane_info[0].bytesperline <= 0)
+        return AVERROR(EINVAL);
+    dst_stride = out->plane_info[0].bytesperline;
+    if (dst_stride < dst_width || dst_stride < dst_chroma_width ||
+        dst_height > SIZE_MAX / dst_stride)
+        return AVERROR(EINVAL);
+
+    luma_size = dst_stride * dst_height;
+    if (dst_chroma_rows > (SIZE_MAX - luma_size) / dst_stride)
+        return AVERROR(EINVAL);
+    image_size = luma_size + dst_stride * dst_chroma_rows;
+    if (out->plane_info[0].length > UINT32_MAX)
+        return AVERROR(EINVAL);
+    if (pix->sizeimage < image_size ||
+        pix->sizeimage > out->plane_info[0].length)
+        return AVERROR(ENOSPC);
+
+    ret = v4l2_frame_plane_bounds(frame, 0, src_width, src_height);
+    if (ret < 0)
+        return ret;
+    ret = v4l2_frame_plane_bounds(frame, 1, src_chroma_width,
+                                  src_chroma_rows);
+    if (ret < 0)
+        return ret;
+
+    memset(dst, 0, pix->sizeimage);
+    for (y = 0; y < src_height; y++)
+        memcpy(dst + y * dst_stride,
+               frame->data[0] + (ptrdiff_t)y * frame->linesize[0],
+               src_width);
+    dst += luma_size;
+    for (y = 0; y < src_chroma_rows; y++)
+        memcpy(dst + y * dst_stride,
+               frame->data[1] + (ptrdiff_t)y * frame->linesize[1],
+               src_chroma_width);
+
+    out->buf.bytesused = pix->sizeimage;
+    out->buf.length = out->plane_info[0].length;
     return 0;
 }
 
@@ -364,11 +483,16 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 {
     int i, ret;
     struct v4l2_format fmt = out->context->format;
-    int pixel_format = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
-                       fmt.fmt.pix_mp.pixelformat : fmt.fmt.pix.pixelformat;
+    uint32_t pixel_format = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
+                            fmt.fmt.pix_mp.pixelformat : fmt.fmt.pix.pixelformat;
     int height       = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
                        fmt.fmt.pix_mp.height : fmt.fmt.pix.height;
     int is_planar_format = 0;
+
+    if (!V4L2_TYPE_IS_MULTIPLANAR(fmt.type) &&
+        (pixel_format == V4L2_PIX_FMT_NV12 ||
+         pixel_format == V4L2_PIX_FMT_NV21))
+        return v4l2_buffer_swframe_nv12_to_buf(frame, out, pixel_format);
 
     switch (pixel_format) {
     case V4L2_PIX_FMT_YUV420M:
@@ -397,17 +521,26 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
     if (!is_planar_format) {
         const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
         int planes_nb = 0;
-        int offset = 0;
+        size_t offset = 0;
+
+        if (!desc || height <= 0)
+            return AVERROR(EINVAL);
 
         for (i = 0; i < desc->nb_components; i++)
             planes_nb = FFMAX(planes_nb, desc->comp[i].plane + 1);
 
         for (i = 0; i < planes_nb; i++) {
-            int size, h = height;
+            size_t size;
+            int h = height;
             if (i == 1 || i == 2) {
                 h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
             }
-            size = frame->linesize[i] * h;
+            if (!frame->data[i] || frame->linesize[i] <= 0 ||
+                h > SIZE_MAX / frame->linesize[i])
+                return AVERROR(EINVAL);
+            size = (size_t)frame->linesize[i] * h;
+            if (size > SIZE_MAX - offset)
+                return AVERROR(EINVAL);
             ret = v4l2_bufref_to_buf(out, 0, frame->data[i], size, offset);
             if (ret)
                 return ret;
@@ -502,6 +635,13 @@ int ff_v4l2_buffer_buf_to_avpkt(AVPacket *pkt, V4L2Buffer *avbuf)
 int ff_v4l2_buffer_avpkt_to_buf(const AVPacket *pkt, V4L2Buffer *out)
 {
     int ret;
+
+    if (pkt->size < 0 || pkt->size > out->plane_info[0].length) {
+        av_log(logger(out), AV_LOG_ERROR,
+               "compressed packet size %d exceeds output buffer size %zu\n",
+               pkt->size, out->plane_info[0].length);
+        return AVERROR(ENOSPC);
+    }
 
     ret = v4l2_bufref_to_buf(out, 0, pkt->data, pkt->size, 0);
     if (ret)

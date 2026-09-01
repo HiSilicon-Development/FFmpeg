@@ -73,6 +73,7 @@ typedef struct V4L2m2mPriv {
 
     V4L2m2mContext *context;   ///< RefStruct reference
     AVCodecParserContext *mpeg4_parser;
+    int wmv3_sequence_queued;
 
     int num_output_buffers;
     int num_capture_buffers;

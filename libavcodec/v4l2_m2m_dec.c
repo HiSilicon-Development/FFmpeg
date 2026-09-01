@@ -164,6 +164,33 @@ static int v4l2_mpeg4_set_packet_pts(AVCodecContext *avctx,
     return 0;
 }
 
+static int v4l2_wmv3_queue_sequence(AVCodecContext *avctx,
+                                    V4L2m2mPriv *priv,
+                                    V4L2Context *output)
+{
+    AVPacket sequence = { 0 };
+    int ret;
+
+    if (avctx->codec_id != AV_CODEC_ID_WMV3 || priv->wmv3_sequence_queued)
+        return 0;
+    if (!avctx->extradata || avctx->extradata_size != 4) {
+        av_log(avctx, AV_LOG_ERROR,
+               "WMV3 V4L2 requires a 4-byte Annex L sequence header\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    sequence.data = avctx->extradata;
+    sequence.size = avctx->extradata_size;
+    sequence.pts = AV_NOPTS_VALUE;
+    sequence.dts = AV_NOPTS_VALUE;
+    ret = ff_v4l2_context_enqueue_packet(output, &sequence);
+    if (ret < 0)
+        return ret;
+
+    priv->wmv3_sequence_queued = 1;
+    return 0;
+}
+
 static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     V4L2m2mPriv *priv = avctx->priv_data;
@@ -171,6 +198,10 @@ static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     V4L2Context *const capture = &s->capture;
     V4L2Context *const output = &s->output;
     int ret;
+
+    ret = v4l2_wmv3_queue_sequence(avctx, priv, output);
+    if (ret < 0)
+        return ret;
 
     if (!s->buf_pkt.size) {
         ret = ff_decode_get_packet(avctx, &s->buf_pkt);
@@ -198,12 +229,8 @@ static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
     if (!s->draining) {
         ret = v4l2_try_start(avctx);
-        if (ret) {
-            /* can't recover */
-            if (ret != AVERROR(ENOMEM))
-                ret = 0;
+        if (ret)
             goto fail;
-        }
     }
 
 dequeue:
@@ -310,5 +337,6 @@ M2MDEC(mpeg2, "MPEG2", AV_CODEC_ID_MPEG2VIDEO, NULL);
 M2MDEC(mpeg4, "MPEG4", AV_CODEC_ID_MPEG4,      "mpeg4_unpack_bframes");
 M2MDEC(h263,  "H.263", AV_CODEC_ID_H263,       NULL);
 M2MDEC(vc1 ,  "VC1",   AV_CODEC_ID_VC1,        NULL);
+M2MDEC(wmv3,  "WMV3",  AV_CODEC_ID_WMV3,       NULL);
 M2MDEC(vp8,   "VP8",   AV_CODEC_ID_VP8,        NULL);
 M2MDEC(vp9,   "VP9",   AV_CODEC_ID_VP9,        NULL);

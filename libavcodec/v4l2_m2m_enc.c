@@ -38,7 +38,7 @@
 #define MPEG_CID(x) V4L2_CID_MPEG_VIDEO_##x
 #define MPEG_VIDEO(x) V4L2_MPEG_VIDEO_##x
 
-static inline void v4l2_set_timeperframe(V4L2m2mContext *s, unsigned int num, unsigned int den)
+static inline int v4l2_set_timeperframe(V4L2m2mContext *s, unsigned int num, unsigned int den)
 {
     struct v4l2_streamparm parm = { 0 };
 
@@ -46,8 +46,15 @@ static inline void v4l2_set_timeperframe(V4L2m2mContext *s, unsigned int num, un
     parm.parm.output.timeperframe.denominator = den;
     parm.parm.output.timeperframe.numerator = num;
 
-    if (ioctl(s->fd, VIDIOC_S_PARM, &parm) < 0)
-        av_log(s->avctx, AV_LOG_WARNING, "Failed to set timeperframe");
+    if (ioctl(s->fd, VIDIOC_S_PARM, &parm) < 0) {
+        int ret = AVERROR(errno);
+
+        av_log(s->avctx, AV_LOG_ERROR,
+               "Failed to set timeperframe: %s\n", strerror(errno));
+        return ret;
+    }
+
+    return 0;
 }
 
 static inline void v4l2_set_ext_ctrl(V4L2m2mContext *s, unsigned int id, signed int value, const char *name, int log_warning)
@@ -189,8 +196,12 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
     /**
      * settings
      */
-    if (avctx->framerate.num || avctx->framerate.den)
-        v4l2_set_timeperframe(s, avctx->framerate.den, avctx->framerate.num);
+    if (avctx->framerate.num || avctx->framerate.den) {
+        ret = v4l2_set_timeperframe(s, avctx->framerate.den,
+                                    avctx->framerate.num);
+        if (ret < 0)
+            return ret;
+    }
 
     /* set ext ctrls */
     v4l2_set_ext_ctrl(s, MPEG_CID(HEADER_MODE), MPEG_VIDEO(HEADER_MODE_SEPARATE), "header mode", 0);

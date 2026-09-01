@@ -395,6 +395,7 @@ extern const FFCodec ff_wmv2_encoder;
 extern const FFCodec ff_wmv2_decoder;
 extern const FFCodec ff_wmv3_decoder;
 extern const FFCodec ff_wmv3image_decoder;
+extern const FFCodec ff_wmv3_v4l2m2m_decoder;
 extern const FFCodec ff_wnv1_decoder;
 extern const FFCodec ff_xan_wc3_decoder;
 extern const FFCodec ff_xan_wc4_decoder;
