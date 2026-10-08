@@ -3710,7 +3710,7 @@ static int decode_nal_units(HEVCContext *s, const uint8_t *buf, int length)
     if (ret < 0) {
         av_log(s->avctx, AV_LOG_ERROR,
                "Error splitting the input into NAL units.\n");
-        return ret;
+        goto fail;
     }
 
     for (int i = 0; i < s->pkt.nb_nals; i++) {
@@ -3795,6 +3795,12 @@ fail:
         if (s->avctx->active_thread_type == FF_THREAD_FRAME)
             ff_progress_frame_report(&l->cur_frame->tf, INT_MAX);
     }
+
+    /* Header-only and undecodable live-join packets do not consume the
+     * sequence boundary. The first started base-layer picture still needs
+     * it so a CRA derives NoRaslOutputFlag and skips its undecodable RASLs. */
+    if (!s->layers[0].cur_frame)
+        s->eos |= s->last_eos;
 
     return ret;
 }

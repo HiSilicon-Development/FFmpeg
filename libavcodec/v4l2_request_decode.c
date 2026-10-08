@@ -438,16 +438,15 @@ static int v4l2_request_post_process(void *logctx, AVFrame *frame)
     bool defer = ctx->defer_capture_wait &&
         (!ctx->defer_capture_wait_auto ||
          (!(frame->flags & AV_FRAME_FLAG_INTERLACED) &&
-          (frame->width > desc->capture.width ||
-           frame->height > desc->capture.height)));
+          ff_v4l2_request_get_sw_format(&ctx->format) == AV_PIX_FMT_NV12));
     int ret;
 
     /*
-     * The normal path completes capture before publishing the frame.  The
-     * opt-in pipeline path publishes the DRM frame as soon as its request has
-     * been queued, then waits when hwdownload actually maps it.  This lets the
-     * frame-thread parser queue the next request while the device finishes
-     * VDH/VPSS, without exposing incomplete pixels to the CPU.
+     * The normal path completes capture before publishing the frame. The
+     * opt-in pipeline publishes progressive NV12 frames with their wait
+     * callback, including native-size output. Consumers must complete that
+     * callback before accessing pixels or importing the DMA-BUF for rendering.
+     * Interlaced auto mode still completes capture before temporal DEI.
      */
     if (!defer) {
         ret = ff_v4l2_request_wait_capture(ctx, &desc->capture, true);

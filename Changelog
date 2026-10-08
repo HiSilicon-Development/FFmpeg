@@ -2,6 +2,9 @@ Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
 version 9.0.1:
+ avcodec/hevc: retain pending sequence boundaries across header-only live joins
+ avcodec/v4l2_request_hevc: reject unavailable active references instead of aliasing DPB slot zero
+ avcodec/v4l2_request: retain completion callbacks for native progressive NV12 in auto pipeline mode
  Bump for 9.0.1
  avcodec/lcldec: clear what the multithread chunks leave undecoded
  avformat/mlv: end the LJ92 packet where its data ends

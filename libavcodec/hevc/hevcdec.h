@@ -524,8 +524,8 @@ typedef struct HEVCContext {
     int poc;
     int poc_tid0;
     int slice_idx; ///< number of the slice being currently decoded
-    int eos;       ///< current packet contains an EOS/EOB NAL
-    int last_eos;  ///< last packet contains an EOS/EOB NAL
+    int eos;       ///< EOS/EOB or initial/flush boundary pending a base-layer picture
+    int last_eos;  ///< pending sequence boundary at the start of the current packet
     int recovery_poc;
 
     // NoRaslOutputFlag associated with the last IRAP frame

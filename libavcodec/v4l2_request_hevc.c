@@ -96,13 +96,16 @@ static void fill_pred_weight_table(struct v4l2_hevc_pred_weight_table *table,
     }
 }
 
-static uint8_t get_ref_pic_index(const HEVCContext *h, const HEVCFrame *frame,
+static int get_ref_pic_index(const HEVCContext *h, const HEVCFrame *frame,
                                  struct v4l2_ctrl_hevc_decode_params *decode_params)
 {
     uint64_t timestamp;
 
-    if (!frame || !frame->f)
-        return 0;
+    if (!frame || !frame->f || (frame->flags & HEVC_FRAME_FLAG_UNAVAILABLE)) {
+        av_log(h->avctx, AV_LOG_ERROR,
+               "HEVC reference is unavailable for hardware decoding\n");
+        return AVERROR(EINVAL);
+    }
 
     timestamp = ff_v4l2_request_get_capture_timestamp(frame->f);
 
@@ -112,16 +115,36 @@ static uint8_t get_ref_pic_index(const HEVCContext *h, const HEVCFrame *frame,
             return i;
     }
 
+    av_log(h->avctx, AV_LOG_ERROR,
+           "HEVC reference with POC %d is absent from the request DPB\n",
+           frame->poc);
+    return AVERROR(EINVAL);
+}
+
+static int fill_ref_pic_list(const HEVCContext *h, const RefPicList *rpl,
+                             uint8_t *indices,
+                             struct v4l2_ctrl_hevc_decode_params *decode_params)
+{
+    if (rpl->nb_refs < 0 || rpl->nb_refs > V4L2_HEVC_DPB_ENTRIES_NUM_MAX)
+        return AVERROR(EINVAL);
+
+    for (int i = 0; i < rpl->nb_refs; i++) {
+        int index = get_ref_pic_index(h, rpl->ref[i], decode_params);
+        if (index < 0)
+            return index;
+        indices[i] = index;
+    }
+
     return 0;
 }
 
-static void fill_decode_params(struct v4l2_ctrl_hevc_decode_params *decode_params,
+static int fill_decode_params(struct v4l2_ctrl_hevc_decode_params *decode_params,
                                const HEVCContext *h)
 {
     const HEVCLayerContext *l = &h->layers[h->cur_layer];
     const HEVCFrame *pic = h->cur_frame;
     const SliceHeader *sh = &h->sh;
-    int i, entries = 0;
+    int i, ret, entries = 0;
 
     *decode_params = (struct v4l2_ctrl_hevc_decode_params) {
         .pic_order_cnt_val = h->poc,
@@ -138,11 +161,20 @@ static void fill_decode_params(struct v4l2_ctrl_hevc_decode_params *decode_param
                                 h->sh.short_term_rps->rps_idx_num_delta_pocs;
 #endif
 
+    /* CRA RPS following sets may contain FFmpeg's synthetic unavailable
+     * pictures. They have no reconstructed hardware surface and must not
+     * enter the request DPB. Current RPS and slice lists are checked below,
+     * so selecting one remains a hard error rather than an index-0 alias. */
     for (i = 0; i < FF_ARRAY_ELEMS(l->DPB); i++) {
         const HEVCFrame *frame = &l->DPB[i];
         if (frame != pic &&
+            !(frame->flags & HEVC_FRAME_FLAG_UNAVAILABLE) &&
             (frame->flags & (HEVC_FRAME_FLAG_LONG_REF | HEVC_FRAME_FLAG_SHORT_REF))) {
-            struct v4l2_hevc_dpb_entry *entry = &decode_params->dpb[entries++];
+            struct v4l2_hevc_dpb_entry *entry;
+
+            if (!frame->f || entries >= FF_ARRAY_ELEMS(decode_params->dpb))
+                return AVERROR(EINVAL);
+            entry = &decode_params->dpb[entries++];
 
             entry->timestamp = ff_v4l2_request_get_capture_timestamp(frame->f);
             entry->field_pic = !!(frame->f->flags & AV_FRAME_FLAG_INTERLACED);
@@ -165,14 +197,16 @@ static void fill_decode_params(struct v4l2_ctrl_hevc_decode_params *decode_param
     if (sh->no_output_of_prior_pics_flag)
         decode_params->flags |= V4L2_HEVC_DECODE_PARAM_FLAG_NO_OUTPUT_OF_PRIOR;
 
-    for (i = 0; i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++) {
-        decode_params->poc_st_curr_before[i] =
-            get_ref_pic_index(h, h->rps[ST_CURR_BEF].ref[i], decode_params);
-        decode_params->poc_st_curr_after[i] =
-            get_ref_pic_index(h, h->rps[ST_CURR_AFT].ref[i], decode_params);
-        decode_params->poc_lt_curr[i] =
-            get_ref_pic_index(h, h->rps[LT_CURR].ref[i], decode_params);
-    }
+    ret = fill_ref_pic_list(h, &h->rps[ST_CURR_BEF],
+                           decode_params->poc_st_curr_before, decode_params);
+    if (ret < 0)
+        return ret;
+    ret = fill_ref_pic_list(h, &h->rps[ST_CURR_AFT],
+                           decode_params->poc_st_curr_after, decode_params);
+    if (ret < 0)
+        return ret;
+    return fill_ref_pic_list(h, &h->rps[LT_CURR],
+                             decode_params->poc_lt_curr, decode_params);
 }
 
 static int fill_slice_params(V4L2RequestControlsHEVC *controls, int slice,
@@ -181,8 +215,7 @@ static int fill_slice_params(V4L2RequestControlsHEVC *controls, int slice,
     struct v4l2_ctrl_hevc_slice_params *slice_params = &controls->frame_slice_params[slice];
     struct v4l2_ctrl_hevc_decode_params *decode_params = &controls->decode_params;
     const SliceHeader *sh = &h->sh;
-    RefPicList *rpl;
-    int i, offsets;
+    int i, offsets, ret;
 
     *slice_params = (struct v4l2_ctrl_hevc_slice_params) {
         .bit_size = 0,
@@ -258,15 +291,17 @@ static int fill_slice_params(V4L2RequestControlsHEVC *controls, int slice,
         slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT;
 
     if (sh->slice_type != HEVC_SLICE_I) {
-        rpl = &h->cur_frame->refPicList[0];
-        for (i = 0; i < rpl->nb_refs; i++)
-            slice_params->ref_idx_l0[i] = get_ref_pic_index(h, rpl->ref[i], decode_params);
+        ret = fill_ref_pic_list(h, &h->cur_frame->refPicList[0],
+                               slice_params->ref_idx_l0, decode_params);
+        if (ret < 0)
+            return ret;
     }
 
     if (sh->slice_type == HEVC_SLICE_B) {
-        rpl = &h->cur_frame->refPicList[1];
-        for (i = 0; i < rpl->nb_refs; i++)
-            slice_params->ref_idx_l1[i] = get_ref_pic_index(h, rpl->ref[i], decode_params);
+        ret = fill_ref_pic_list(h, &h->cur_frame->refPicList[1],
+                               slice_params->ref_idx_l1, decode_params);
+        if (ret < 0)
+            return ret;
     }
 
     fill_pred_weight_table(&slice_params->pred_weight_table, h);
@@ -378,7 +413,9 @@ static int v4l2_request_hevc_start_frame(AVCodecContext *avctx,
         return ret;
 
     fill_sps(&controls->sps, h);
-    fill_decode_params(&controls->decode_params, h);
+    ret = fill_decode_params(&controls->decode_params, h);
+    if (ret < 0)
+        return ret;
 
     if (ctx->has_scaling_matrix) {
         const ScalingList *sl = pps->scaling_list_data_present_flag ?
