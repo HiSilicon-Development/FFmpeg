@@ -294,6 +294,10 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
             v4l2_set_ext_ctrl(s, HISTB_VENC_CID_ROI_ENABLE, 1, "roi enable", 0);
             v4l2_set_ext_ctrl(s, HISTB_VENC_CID_ROI_DELTA_QP, priv->roi, "roi delta qp", 0);
         }
+        if (priv->intra_refresh > 0) {
+            v4l2_set_ext_ctrl(s, MPEG_CID(INTRA_REFRESH_PERIOD), priv->intra_refresh, "intra refresh period", 0);
+            v4l2_set_ext_ctrl(s, MPEG_CID(INTRA_REFRESH_PERIOD_TYPE), 1, "intra refresh type", 0);
+        }
         qmin_cid = MPEG_CID(H264_MIN_QP);
         qmax_cid = MPEG_CID(H264_MAX_QP);
         qmin = 0;
@@ -492,7 +496,9 @@ static av_cold int v4l2_encode_close(AVCodecContext *avctx)
     { "num_capture_buffers", "Number of buffers in the capture context", \
         OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, {.i64 = 4 }, 4, INT_MAX, FLAGS }, \
     { "roi", "Configure Region of Interest (ROI) delta QP (-30 to 30, 0=disabled)", \
-        OFFSET(roi), AV_OPT_TYPE_INT, {.i64 = 0 }, -30, 30, FLAGS }
+        OFFSET(roi), AV_OPT_TYPE_INT, {.i64 = 0 }, -30, 30, FLAGS }, \
+    { "intra_refresh", "Intra refresh period in frames (0=disabled)", \
+        OFFSET(intra_refresh), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1000, FLAGS }
 
 static const AVOption mpeg4_options[] = {
     V4L_M2M_CAPTURE_OPTS,
