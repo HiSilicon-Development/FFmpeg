@@ -245,7 +245,19 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
     /* set ext ctrls */
     v4l2_set_ext_ctrl(s, MPEG_CID(HEADER_MODE), MPEG_VIDEO(HEADER_MODE_SEPARATE), "header mode", 0);
     v4l2_set_ext_ctrl(s, MPEG_CID(BITRATE) , avctx->bit_rate, "bit rate", 1);
-    v4l2_set_ext_ctrl(s, MPEG_CID(FRAME_RC_ENABLE), 1, "frame level rate control", 0);
+    if (avctx->flags & AV_CODEC_FLAG_QSCALE) {
+        int qp = avctx->global_quality / FF_QP2LAMBDA;
+        if (qp <= 0)
+            qp = 26;
+        v4l2_set_ext_ctrl(s, MPEG_CID(FRAME_RC_ENABLE), 0, "frame level rate control", 0);
+        v4l2_set_ext_ctrl(s, MPEG_CID(H264_I_FRAME_QP), qp, "i frame qp", 0);
+        v4l2_set_ext_ctrl(s, MPEG_CID(H264_P_FRAME_QP), qp, "p frame qp", 0);
+    } else {
+        int bmode = (avctx->rc_max_rate > 0 && avctx->rc_max_rate != avctx->bit_rate) ?
+            V4L2_MPEG_VIDEO_BITRATE_MODE_VBR : V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
+        v4l2_set_ext_ctrl(s, MPEG_CID(FRAME_RC_ENABLE), 1, "frame level rate control", 0);
+        v4l2_set_ext_ctrl(s, MPEG_CID(BITRATE_MODE), bmode, "bitrate mode", 0);
+    }
     v4l2_set_ext_ctrl(s, MPEG_CID(GOP_SIZE), avctx->gop_size,"gop size", 1);
 
     av_log(avctx, AV_LOG_DEBUG,
