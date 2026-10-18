@@ -39,6 +39,11 @@
 
 #define MPEG_CID(x) V4L2_CID_MPEG_VIDEO_##x
 #define MPEG_VIDEO(x) V4L2_MPEG_VIDEO_##x
+#ifndef V4L2_CID_CODEC_BASE
+#define V4L2_CID_CODEC_BASE (V4L2_CTRL_CLASS_CODEC | 0x900)
+#endif
+#define HISTB_VENC_CID_ROI_ENABLE	(V4L2_CID_CODEC_BASE + 0x200)
+#define HISTB_VENC_CID_ROI_DELTA_QP	(V4L2_CID_CODEC_BASE + 0x201)
 
 static inline int v4l2_set_timeperframe(V4L2m2mContext *s, unsigned int num, unsigned int den)
 {
@@ -215,6 +220,7 @@ static int v4l2_set_sar(V4L2m2mContext *s)
 static int v4l2_prepare_encoder(V4L2m2mContext *s)
 {
     AVCodecContext *avctx = s->avctx;
+    V4L2m2mPriv *priv = s->priv;
     int qmin_cid, qmax_cid, qmin, qmax;
     int ret, val;
 
@@ -283,6 +289,10 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
             v4l2_set_ext_ctrl(s, MPEG_CID(MULTI_SLICE_MODE),
                               V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_MB, "slice mode", 1);
             v4l2_set_ext_ctrl(s, MPEG_CID(MULTI_SLICE_MAX_MB), max_mb, "slice max mb", 1);
+        }
+        if (priv->roi) {
+            v4l2_set_ext_ctrl(s, HISTB_VENC_CID_ROI_ENABLE, 1, "roi enable", 0);
+            v4l2_set_ext_ctrl(s, HISTB_VENC_CID_ROI_DELTA_QP, priv->roi, "roi delta qp", 0);
         }
         qmin_cid = MPEG_CID(H264_MIN_QP);
         qmax_cid = MPEG_CID(H264_MAX_QP);
@@ -480,7 +490,9 @@ static av_cold int v4l2_encode_close(AVCodecContext *avctx)
 #define V4L_M2M_CAPTURE_OPTS \
     V4L_M2M_DEFAULT_OPTS,\
     { "num_capture_buffers", "Number of buffers in the capture context", \
-        OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, {.i64 = 4 }, 4, INT_MAX, FLAGS }
+        OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, {.i64 = 4 }, 4, INT_MAX, FLAGS }, \
+    { "roi", "Configure Region of Interest (ROI) delta QP (-30 to 30, 0=disabled)", \
+        OFFSET(roi), AV_OPT_TYPE_INT, {.i64 = 0 }, -30, 30, FLAGS }
 
 static const AVOption mpeg4_options[] = {
     V4L_M2M_CAPTURE_OPTS,
