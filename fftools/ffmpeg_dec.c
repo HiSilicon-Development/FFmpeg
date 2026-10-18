@@ -16,7 +16,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#if __has_include(<stdbit.h>)
 #include <stdbit.h>
+#else
+#define stdc_count_ones(x) __builtin_popcount(x)
+#define stdc_trailing_zeros(x) __builtin_ctz(x)
+#endif
 #include <string.h>
 
 #include "libavutil/avassert.h"

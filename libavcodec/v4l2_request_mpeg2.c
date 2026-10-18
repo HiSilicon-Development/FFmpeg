@@ -40,9 +40,12 @@ static int v4l2_request_mpeg2_start_frame(AVCodecContext *avctx,
     V4L2RequestControlsMPEG2 *controls = s->cur_pic.ptr->hwaccel_picture_private;
     int ret;
 
-    if (avctx->profile < 0 || avctx->profile > 7 ||
-        avctx->level < 0 || avctx->level > 15)
+    if (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) {
+        /* MPEG-1 has no profile/level indication. */
+    } else if (avctx->profile < 0 || avctx->profile > 7 ||
+               avctx->level < 0 || avctx->level > 15) {
         return AVERROR_INVALIDDATA;
+    }
 
     ret = ff_v4l2_request_start_frame(avctx, &controls->pic, s->cur_pic.ptr->f);
     if (ret)
@@ -55,11 +58,12 @@ static int v4l2_request_mpeg2_start_frame(AVCodecContext *avctx,
         .vbv_buffer_size = controls->pic.output->size,
 
         /* ISO/IEC 13818-2, ITU-T Rec. H.262: Sequence extension */
-        .profile_and_level_indication = avctx->profile << 4 | avctx->level,
-        .chroma_format = s->chroma_format,
+        .profile_and_level_indication = (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) ?
+            0 : (avctx->profile << 4 | avctx->level),
+        .chroma_format = s->chroma_format ? s->chroma_format : 1,
     };
 
-    if (s->progressive_sequence)
+    if (s->progressive_sequence || avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO)
         controls->sequence.flags |= V4L2_MPEG2_SEQ_FLAG_PROGRESSIVE;
 
     controls->picture = (struct v4l2_ctrl_mpeg2_picture) {
@@ -67,18 +71,22 @@ static int v4l2_request_mpeg2_start_frame(AVCodecContext *avctx,
         .picture_coding_type = s->pict_type,
 
         /* ISO/IEC 13818-2, ITU-T Rec. H.262: Picture coding extension */
-        .f_code[0][0] = s->mpeg_f_code[0][0],
-        .f_code[0][1] = s->mpeg_f_code[0][1],
-        .f_code[1][0] = s->mpeg_f_code[1][0],
-        .f_code[1][1] = s->mpeg_f_code[1][1],
-        .picture_structure = s->picture_structure,
+        .f_code[0][0] = s->mpeg_f_code[0][0] ? s->mpeg_f_code[0][0] : 15,
+        .f_code[0][1] = (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) ?
+            (s->mpeg_f_code[0][0] ? s->mpeg_f_code[0][0] : 15) :
+            (s->mpeg_f_code[0][1] ? s->mpeg_f_code[0][1] : 15),
+        .f_code[1][0] = s->mpeg_f_code[1][0] ? s->mpeg_f_code[1][0] : 15,
+        .f_code[1][1] = (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO) ?
+            (s->mpeg_f_code[1][0] ? s->mpeg_f_code[1][0] : 15) :
+            (s->mpeg_f_code[1][1] ? s->mpeg_f_code[1][1] : 15),
+        .picture_structure = s->picture_structure ? s->picture_structure : 3,
         .intra_dc_precision = s->intra_dc_precision,
     };
 
     if (s->top_field_first)
         controls->picture.flags |= V4L2_MPEG2_PIC_FLAG_TOP_FIELD_FIRST;
 
-    if (s->frame_pred_frame_dct)
+    if (s->frame_pred_frame_dct || avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO)
         controls->picture.flags |= V4L2_MPEG2_PIC_FLAG_FRAME_PRED_DCT;
 
     if (s->concealment_motion_vectors)
@@ -169,6 +177,22 @@ const FFHWAccel ff_mpeg2_v4l2request_hwaccel = {
     .p.name             = "mpeg2_v4l2request",
     .p.type             = AVMEDIA_TYPE_VIDEO,
     .p.id               = AV_CODEC_ID_MPEG2VIDEO,
+    .p.pix_fmt          = AV_PIX_FMT_DRM_PRIME,
+    .start_frame        = v4l2_request_mpeg2_start_frame,
+    .decode_slice       = v4l2_request_mpeg2_decode_slice,
+    .end_frame          = v4l2_request_mpeg2_end_frame,
+    .flush              = ff_v4l2_request_flush,
+    .frame_priv_data_size = sizeof(V4L2RequestControlsMPEG2),
+    .init               = v4l2_request_mpeg2_init,
+    .uninit             = ff_v4l2_request_uninit,
+    .priv_data_size     = sizeof(V4L2RequestContext),
+    .frame_params       = ff_v4l2_request_frame_params,
+};
+
+const FFHWAccel ff_mpeg1_v4l2request_hwaccel = {
+    .p.name             = "mpeg1_v4l2request",
+    .p.type             = AVMEDIA_TYPE_VIDEO,
+    .p.id               = AV_CODEC_ID_MPEG1VIDEO,
     .p.pix_fmt          = AV_PIX_FMT_DRM_PRIME,
     .start_frame        = v4l2_request_mpeg2_start_frame,
     .decode_slice       = v4l2_request_mpeg2_decode_slice,

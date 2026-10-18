@@ -788,6 +788,9 @@ static av_cold int mpeg_decode_init(AVCodecContext *avctx)
 }
 
 static const enum AVPixelFormat mpeg1_hwaccel_pixfmt_list_420[] = {
+#if CONFIG_MPEG1_V4L2REQUEST_HWACCEL
+    AV_PIX_FMT_DRM_PRIME,
+#endif
 #if CONFIG_MPEG1_NVDEC_HWACCEL
     AV_PIX_FMT_CUDA,
 #endif
@@ -2648,6 +2651,9 @@ const FFCodec ff_mpeg1video_decoder = {
     .flush                 = flush,
     .p.max_lowres          = 3,
     .hw_configs            = (const AVCodecHWConfigInternal *const []) {
+#if CONFIG_MPEG1_V4L2REQUEST_HWACCEL
+                               HWACCEL_V4L2REQUEST(mpeg1),
+#endif
 #if CONFIG_MPEG1_NVDEC_HWACCEL
                                HWACCEL_NVDEC(mpeg1),
 #endif
