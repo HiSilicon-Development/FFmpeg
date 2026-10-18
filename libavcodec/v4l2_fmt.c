@@ -110,6 +110,12 @@ static const struct fmt_conversion {
 #ifdef V4L2_PIX_FMT_VC1_ANNEX_L
     { AV_FMT(NONE),        AV_CODEC(WMV3),        V4L2_FMT(VC1_ANNEX_L) },
 #endif
+#ifdef V4L2_PIX_FMT_RV30
+    { AV_FMT(NONE),        AV_CODEC(RV30),        V4L2_FMT(RV30) },
+#endif
+#ifdef V4L2_PIX_FMT_RV40
+    { AV_FMT(NONE),        AV_CODEC(RV40),        V4L2_FMT(RV40) },
+#endif
 };
 
 uint32_t ff_v4l2_format_avcodec_to_v4l2(enum AVCodecID avcodec)

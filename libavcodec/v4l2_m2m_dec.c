@@ -379,3 +379,5 @@ M2MDEC(vc1 ,  "VC1",   AV_CODEC_ID_VC1,        NULL);
 M2MDEC(wmv3,  "WMV3",  AV_CODEC_ID_WMV3,       NULL);
 M2MDEC(vp8,   "VP8",   AV_CODEC_ID_VP8,        NULL);
 M2MDEC(vp9,   "VP9",   AV_CODEC_ID_VP9,        NULL);
+M2MDEC(rv30,  "RealVideo 3.0", AV_CODEC_ID_RV30, NULL);
+M2MDEC(rv40,  "RealVideo 4.0", AV_CODEC_ID_RV40, NULL);

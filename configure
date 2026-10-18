@@ -3729,6 +3729,8 @@ vc1_mmal_decoder_deps="mmal"
 vc1_qsv_decoder_select="qsvdec"
 vc1_v4l2m2m_decoder_deps="v4l2_m2m vc1_v4l2_m2m"
 wmv3_v4l2m2m_decoder_deps="v4l2_m2m wmv3_v4l2_m2m"
+rv30_v4l2m2m_decoder_deps="v4l2_m2m rv30_v4l2_m2m"
+rv40_v4l2m2m_decoder_deps="v4l2_m2m rv40_v4l2_m2m"
 vp8_cuvid_decoder_deps="cuvid"
 vp8_mediacodec_decoder_deps="mediacodec"
 vp8_mediacodec_encoder_deps="mediacodec"
@@ -7673,6 +7675,8 @@ if enabled v4l2_m2m; then
     check_cc vp8_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP8;"
     check_cc vp9_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP9;"
     check_cc mjpeg_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_JPEG;"
+    check_cc rv30_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_RV30;"
+    check_cc rv40_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_RV40;"
 fi
 
 if enabled v4l2_request; then
