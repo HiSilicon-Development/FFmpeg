@@ -103,6 +103,24 @@ static inline void v4l2_set_jpeg_quality(V4L2m2mContext *s)
     else
         av_log(avctx, AV_LOG_DEBUG, "Encoder: JPEG compression quality = %d\n", quality);
 }
+static inline void v4l2_set_jpeg_rotation(V4L2m2mContext *s)
+{
+    AVCodecContext *avctx = s->avctx;
+    V4L2m2mPriv *priv = avctx->priv_data;
+    struct v4l2_control ctrl = { 0 };
+
+    if (!priv || !priv->rotate)
+        return;
+
+    ctrl.id = V4L2_CID_ROTATE;
+    ctrl.value = priv->rotate;
+
+    if (ioctl(s->fd, VIDIOC_S_CTRL, &ctrl) < 0)
+        av_log(avctx, AV_LOG_WARNING, "Failed to set JPEG rotation to %d: %s\n",
+               priv->rotate, strerror(errno));
+    else
+        av_log(avctx, AV_LOG_DEBUG, "Encoder: JPEG rotation = %d\n", priv->rotate);
+}
 
 static int v4l2_prepare_encoder(V4L2m2mContext *s)
 {
@@ -115,6 +133,7 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
      * settings
      */
     v4l2_set_jpeg_quality(s);
+    v4l2_set_jpeg_rotation(s);
 
     return 0;
 }
@@ -236,6 +255,8 @@ static const AVOption mjpeg_enc_options[] = {
     V4L_M2M_DEFAULT_OPTS,
     { "num_capture_buffers", "Number of buffers in the capture context",
         OFFSET(num_capture_buffers), AV_OPT_TYPE_INT, {.i64 = 4 }, 4, INT_MAX, FLAGS },
+    { "rotate", "Rotate angle in degrees (0, 90, 180, 270)",
+        OFFSET(rotate), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 270, FLAGS },
     { NULL },
 };
 
