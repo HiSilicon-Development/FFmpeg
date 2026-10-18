@@ -245,6 +245,7 @@ static const FFCodecDefault v4l2_m2m_defaults[] = {
     { NULL },
 };
 
+
 #define M2MENC_CLASS(NAME, OPTIONS_NAME) \
     static const AVClass v4l2_m2m_ ## NAME ## _enc_class = { \
         .class_name = #NAME "_v4l2m2m_encoder", \
@@ -266,7 +267,9 @@ static const FFCodecDefault v4l2_m2m_defaults[] = {
         FF_CODEC_RECEIVE_PACKET_CB(v4l2_receive_packet), \
         .close          = v4l2_encode_close, \
         .defaults       = v4l2_m2m_defaults, \
-        CODEC_PIXFMTS(AV_PIX_FMT_NV12), \
+        CODEC_PIXFMTS(AV_PIX_FMT_NV12, AV_PIX_FMT_YUV420P, AV_PIX_FMT_NV16, \
+                      AV_PIX_FMT_NV24, AV_PIX_FMT_YUYV422, AV_PIX_FMT_YVYU422, \
+                      AV_PIX_FMT_UYVY422), \
         .p.capabilities = AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_DELAY, \
         .color_ranges   = AVCOL_RANGE_MPEG, \
         .caps_internal  = FF_CODEC_CAP_NOT_INIT_THREADSAFE | \
