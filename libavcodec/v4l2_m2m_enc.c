@@ -44,6 +44,8 @@
 #endif
 #define HISTB_VENC_CID_ROI_ENABLE	(V4L2_CID_CODEC_BASE + 0x200)
 #define HISTB_VENC_CID_ROI_DELTA_QP	(V4L2_CID_CODEC_BASE + 0x201)
+#define HISTB_VENC_CID_OSD_ENABLE	(V4L2_CID_CODEC_BASE + 0x202)
+#define HISTB_VENC_CID_OSD_ALPHA	(V4L2_CID_CODEC_BASE + 0x203)
 
 static inline int v4l2_set_timeperframe(V4L2m2mContext *s, unsigned int num, unsigned int den)
 {
@@ -298,6 +300,10 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
             v4l2_set_ext_ctrl(s, MPEG_CID(INTRA_REFRESH_PERIOD), priv->intra_refresh, "intra refresh period", 0);
             v4l2_set_ext_ctrl(s, MPEG_CID(INTRA_REFRESH_PERIOD_TYPE), 1, "intra refresh type", 0);
         }
+        if (priv->osd > 0) {
+            v4l2_set_ext_ctrl(s, HISTB_VENC_CID_OSD_ENABLE, 1, "osd enable", 0);
+            v4l2_set_ext_ctrl(s, HISTB_VENC_CID_OSD_ALPHA, priv->osd, "osd alpha", 0);
+        }
         qmin_cid = MPEG_CID(H264_MIN_QP);
         qmax_cid = MPEG_CID(H264_MAX_QP);
         qmin = 0;
@@ -498,7 +504,9 @@ static av_cold int v4l2_encode_close(AVCodecContext *avctx)
     { "roi", "Configure Region of Interest (ROI) delta QP (-30 to 30, 0=disabled)", \
         OFFSET(roi), AV_OPT_TYPE_INT, {.i64 = 0 }, -30, 30, FLAGS }, \
     { "intra_refresh", "Intra refresh period in frames (0=disabled)", \
-        OFFSET(intra_refresh), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1000, FLAGS }
+        OFFSET(intra_refresh), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 1000, FLAGS }, \
+    { "osd", "Configure hardware OSD overlay alpha (0=disabled, 1-255=alpha)", \
+        OFFSET(osd), AV_OPT_TYPE_INT, {.i64 = 0 }, 0, 255, FLAGS }
 
 static const AVOption mpeg4_options[] = {
     V4L_M2M_CAPTURE_OPTS,

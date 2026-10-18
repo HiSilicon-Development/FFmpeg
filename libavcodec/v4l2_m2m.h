@@ -81,6 +81,7 @@ typedef struct V4L2m2mPriv {
     int rotate;
     int roi;
     int intra_refresh;
+    int osd;
 } V4L2m2mPriv;
 
 /**
