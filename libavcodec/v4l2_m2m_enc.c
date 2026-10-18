@@ -263,6 +263,15 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
             else
                 v4l2_set_ext_ctrl(s, MPEG_CID(H264_PROFILE), val, "h264 profile", 1);
         }
+        if (avctx->slices > 1) {
+            int mb_h = (avctx->height + 15) / 16;
+            int max_mb = (mb_h + avctx->slices - 1) / avctx->slices;
+            if (max_mb < 1)
+                max_mb = 1;
+            v4l2_set_ext_ctrl(s, MPEG_CID(MULTI_SLICE_MODE),
+                              V4L2_MPEG_VIDEO_MULTI_SLICE_MODE_MAX_MB, "slice mode", 1);
+            v4l2_set_ext_ctrl(s, MPEG_CID(MULTI_SLICE_MAX_MB), max_mb, "slice max mb", 1);
+        }
         qmin_cid = MPEG_CID(H264_MIN_QP);
         qmax_cid = MPEG_CID(H264_MAX_QP);
         qmin = 0;
@@ -409,7 +418,7 @@ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
         if (!avctx->hw_frames_ctx)
             return AVERROR(EINVAL);
         frames = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
-        if (frames->sw_format != AV_PIX_FMT_NV12)
+        if (frames->sw_format != AV_PIX_FMT_NV12 && frames->sw_format != AV_PIX_FMT_NV21)
             return AVERROR(EINVAL);
         output->av_pix_fmt = frames->sw_format;
         output->memory = V4L2_MEMORY_DMABUF;
