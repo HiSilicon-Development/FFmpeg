@@ -45,12 +45,16 @@ static const struct fmt_conversion {
     { AV_FMT(GRAY8),       AV_CODEC(RAWVIDEO),    V4L2_FMT(GREY) },
     { AV_FMT(YUV420P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV420) },
     { AV_FMT(YUYV422),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUYV) },
+    { AV_FMT(YVYU422),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YVYU) },
     { AV_FMT(UYVY422),     AV_CODEC(RAWVIDEO),    V4L2_FMT(UYVY) },
     { AV_FMT(YUV422P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV422P) },
     { AV_FMT(YUV411P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV411P) },
     { AV_FMT(YUV410P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV410) },
     { AV_FMT(YUV410P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YVU410) },
     { AV_FMT(NV12),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV12) },
+    { AV_FMT(NV21),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV21) },
+    { AV_FMT(NV16),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV16) },
+    { AV_FMT(NV24),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV24) },
     { AV_FMT(NONE),        AV_CODEC(MJPEG),       V4L2_FMT(MJPEG) },
     { AV_FMT(NONE),        AV_CODEC(MJPEG),       V4L2_FMT(JPEG) },
 #ifdef V4L2_PIX_FMT_SRGGB8
@@ -118,14 +122,14 @@ static const struct fmt_conversion {
 #endif
 };
 
-uint32_t ff_v4l2_format_avcodec_to_v4l2(enum AVCodecID avcodec)
+enum AVCodecID ff_v4l2_format_v4l2_to_avcodec(uint32_t v4l2_fmt)
 {
     int i;
     for (i = 0; i < FF_ARRAY_ELEMS(fmt_map); i++) {
-        if (fmt_map[i].avcodec == avcodec)
-            return fmt_map[i].v4l2_fmt;
+        if (fmt_map[i].v4l2_fmt == v4l2_fmt)
+            return fmt_map[i].avcodec;
     }
-    return 0;
+    return AV_CODEC_ID_NONE;
 }
 
 uint32_t ff_v4l2_format_avfmt_to_v4l2(enum AVPixelFormat avfmt)

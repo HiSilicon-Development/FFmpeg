@@ -34,6 +34,7 @@
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_drm.h"
 #include "libavutil/hwcontext_v4l2request.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/refstruct.h"
 #include "v4l2_context.h"
@@ -489,6 +490,69 @@ static int v4l2_buffer_buf_to_swframe(AVFrame *frame, V4L2Buffer *avbuf)
     return 0;
 }
 
+/* JPEG's single-plane queues contain all image planes at the negotiated
+ * pitch. AVFrame padding and separate plane allocations are not DMA layout. */
+static int v4l2_buffer_jpeg_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
+{
+    const struct v4l2_pix_format *pix = &out->context->format.fmt.pix;
+    int row_bytes[4];
+    ptrdiff_t src_stride[4], dst_stride[4];
+    size_t src_size[4], dst_size[4], size = 0, offset = 0;
+    uint8_t *dst = out->plane_info[0].mm_addr;
+    int i, ret, padded = 0;
+
+    if (out->num_planes != 1 || !dst || frame->format != out->context->av_pix_fmt ||
+        frame->width != pix->width || frame->height != pix->height ||
+        frame->width <= 0 || frame->height <= 0 || !pix->bytesperline)
+        return AVERROR(EINVAL);
+
+    ret = av_image_fill_linesizes(row_bytes, frame->format, frame->width);
+    if (ret < 0)
+        return ret;
+    if (row_bytes[0] <= 0)
+        return AVERROR(EINVAL);
+    for (i = 0; i < 4; i++) {
+        uint64_t stride = (uint64_t)row_bytes[i] * pix->bytesperline;
+
+        if (stride % row_bytes[0] || stride / row_bytes[0] > PTRDIFF_MAX)
+            return AVERROR(EINVAL);
+        src_stride[i] = row_bytes[i];
+        dst_stride[i] = stride / row_bytes[0];
+    }
+    ret = av_image_fill_plane_sizes(src_size, frame->format, frame->height, src_stride);
+    if (ret < 0)
+        return ret;
+    ret = av_image_fill_plane_sizes(dst_size, frame->format, pix->height, dst_stride);
+    if (ret < 0)
+        return ret;
+    for (i = 0; i < 4 && row_bytes[i]; i++) {
+        unsigned int rows = src_size[i] / row_bytes[i];
+
+        if (dst_stride[i] < row_bytes[i] || dst_size[i] > SIZE_MAX - size)
+            return AVERROR(EINVAL);
+        ret = v4l2_frame_plane_bounds(frame, i, row_bytes[i], rows);
+        if (ret < 0)
+            return ret;
+        size += dst_size[i];
+        padded |= dst_stride[i] != row_bytes[i];
+    }
+    if (size > pix->sizeimage || pix->sizeimage > out->plane_info[0].length)
+        return AVERROR(ENOSPC);
+    if (padded || size != pix->sizeimage)
+        memset(dst, 0, pix->sizeimage);
+    for (i = 0; i < 4 && row_bytes[i]; i++) {
+        unsigned int rows = src_size[i] / row_bytes[i];
+
+        for (unsigned int row = 0; row < rows; row++)
+            memcpy(dst + offset + (size_t)row * dst_stride[i],
+                   frame->data[i] + (ptrdiff_t)row * frame->linesize[i], row_bytes[i]);
+        offset += dst_size[i];
+    }
+    out->buf.bytesused = pix->sizeimage;
+    out->buf.length = out->plane_info[0].length;
+    return 0;
+}
+
 static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 {
     int i, ret;
@@ -498,6 +562,10 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
     int height       = V4L2_TYPE_IS_MULTIPLANAR(fmt.type) ?
                        fmt.fmt.pix_mp.height : fmt.fmt.pix.height;
     int is_planar_format = 0;
+
+    if (!V4L2_TYPE_IS_MULTIPLANAR(fmt.type) &&
+        buf_to_m2mctx(out)->avctx->codec_id == AV_CODEC_ID_MJPEG)
+        return v4l2_buffer_jpeg_swframe_to_buf(frame, out);
 
     if (!V4L2_TYPE_IS_MULTIPLANAR(fmt.type) &&
         (pixel_format == V4L2_PIX_FMT_NV12 ||

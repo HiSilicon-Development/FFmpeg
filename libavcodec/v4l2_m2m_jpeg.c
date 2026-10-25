@@ -37,14 +37,14 @@
 #include "v4l2_fmt.h"
 
 /*
- * The HiSilicon JPEG block is a mem2mem codec with NV12 on the raw side and
- * JPEG on the coded side (drivers/media/platform/hisilicon/histb-jpge.c, which
- * enumerates V4L2_PIX_FMT_JPEG and V4L2_PIX_FMT_MJPEG on its capture queue and
- * V4L2_PIX_FMT_NV12 on its output queue).  Because ff_v4l2_format_avcodec_to_v4l2()
- * maps AV_CODEC_ID_MJPEG to V4L2_PIX_FMT_MJPEG, the coded side is driven as
- * MJPEG; both wrappers below therefore keep V4L2_PIX_FMT_MJPEG as the coded
- * format and AV_PIX_FMT_NV12 as the raw one.
+ * JPEG and MJPEG coded fourccs share AV_CODEC_ID_MJPEG. The context selects
+ * one actually enumerated by the device; the raw format is negotiated separately.
  */
+
+typedef struct V4L2JpegDecContext {
+    V4L2m2mPriv v4l2;
+    int picture_pending;
+} V4L2JpegDecContext;
 
 /******************************************************************************
  *
@@ -235,8 +235,16 @@ static av_cold int v4l2_encode_init(AVCodecContext *avctx)
 
     pix_fmt_output = ff_v4l2_format_v4l2_to_avfmt(v4l2_fmt_output, AV_CODEC_ID_RAWVIDEO);
     if (pix_fmt_output != avctx->pix_fmt) {
-        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(pix_fmt_output);
-        av_log(avctx, AV_LOG_ERROR, "Encoder requires %s pixel format.\n", desc->name);
+        av_log(avctx, AV_LOG_ERROR, "Encoder requires %s pixel format.\n",
+               av_get_pix_fmt_name(pix_fmt_output) ?: "an unknown");
+        return AVERROR(EINVAL);
+    }
+    if (V4L2_TYPE_IS_MULTIPLANAR(output->type) ?
+        output->format.fmt.pix_mp.width != avctx->width ||
+        output->format.fmt.pix_mp.height != avctx->height :
+        output->format.fmt.pix.width != avctx->width ||
+        output->format.fmt.pix.height != avctx->height) {
+        av_log(avctx, AV_LOG_ERROR, "Encoder cannot represent the requested dimensions.\n");
         return AVERROR(EINVAL);
     }
 
@@ -335,7 +343,12 @@ static int v4l2_try_start(AVCodecContext *avctx)
     }
 
     /* 2.1 update the AVCodecContext */
-    avctx->pix_fmt = ff_v4l2_format_v4l2_to_avfmt(capture->format.fmt.pix_mp.pixelformat, AV_CODEC_ID_RAWVIDEO);
+    avctx->pix_fmt = ff_v4l2_format_v4l2_to_avfmt(
+        V4L2_TYPE_IS_MULTIPLANAR(capture->type) ?
+        capture->format.fmt.pix_mp.pixelformat :
+        capture->format.fmt.pix.pixelformat, AV_CODEC_ID_RAWVIDEO);
+    if (avctx->pix_fmt == AV_PIX_FMT_NONE)
+        return AVERROR(EINVAL);
     capture->av_pix_fmt = avctx->pix_fmt;
 
     /* 3. set the crop parameters */
@@ -407,42 +420,38 @@ static int v4l2_prepare_decoder(V4L2m2mContext *s)
 
 static int v4l2_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
-    V4L2m2mContext *s = ((V4L2m2mPriv*)avctx->priv_data)->context;
+    V4L2JpegDecContext *priv = avctx->priv_data;
+    V4L2m2mContext *s = priv->v4l2.context;
     V4L2Context *const capture = &s->capture;
     V4L2Context *const output = &s->output;
     int ret;
 
-    if (!s->buf_pkt.size) {
-        ret = ff_decode_get_packet(avctx, &s->buf_pkt);
-        if (ret < 0) {
-            if (ret == AVERROR(EAGAIN))
-                return ff_v4l2_context_dequeue_frame(capture, frame, 0);
-            else if (ret != AVERROR_EOF)
+    if (!priv->picture_pending) {
+        if (!s->buf_pkt.size) {
+            ret = ff_decode_get_packet(avctx, &s->buf_pkt);
+            if (ret < 0)
                 return ret;
         }
-    }
 
-    if (s->draining)
-        goto dequeue;
-
-    ret = ff_v4l2_context_enqueue_packet(output, &s->buf_pkt);
-    if (ret < 0 && ret != AVERROR(EAGAIN))
-        goto fail;
-
-    /* if EAGAIN don't unref packet and try to enqueue in the next iteration */
-    if (ret != AVERROR(EAGAIN))
+        ret = ff_v4l2_context_enqueue_packet(output, &s->buf_pkt);
+        if (ret == AVERROR(EAGAIN))
+            return ret;
         av_packet_unref(&s->buf_pkt);
+        if (ret < 0)
+            return ret;
 
-    if (!s->draining) {
+        priv->picture_pending = 1;
         ret = v4l2_try_start(avctx);
-        if (ret)
-            goto fail;
+        if (ret < 0)
+            return ret;
     }
 
-dequeue:
-    return ff_v4l2_context_dequeue_frame(capture, frame, -1);
-fail:
-    av_packet_unref(&s->buf_pkt);
+    /* JPEG has exactly one completion per picture and no delayed frames.
+     * Do not issue DECODER_CMD_STOP: simple image devices need not implement
+     * it, and STREAMOFF would discard pictures rather than drain them. */
+    ret = ff_v4l2_context_dequeue_frame(capture, frame, -1);
+    if (ret != AVERROR(EAGAIN))
+        priv->picture_pending = 0;
     return ret;
 }
 
@@ -471,11 +480,11 @@ static av_cold int v4l2_decode_init(AVCodecContext *avctx)
     output->av_pix_fmt  = AV_PIX_FMT_NONE;
 
     capture->av_codec_id = AV_CODEC_ID_RAWVIDEO;
-    /* the block decodes straight to NV12, so ask for that unless the caller
-     * pinned a raw format of its own
-     */
-    capture->av_pix_fmt = avctx->pix_fmt == AV_PIX_FMT_NONE ?
-                          AV_PIX_FMT_NV12 : avctx->pix_fmt;
+    /* The parser's planar JPEG format describes the compressed sampling,
+     * not the hardware's raw memory layout. Preserve gray; negotiate a
+     * supported semiplanar layout for color pictures. JPGD emits NV21. */
+    capture->av_pix_fmt = avctx->pix_fmt == AV_PIX_FMT_GRAY8 ?
+                          AV_PIX_FMT_GRAY8 : AV_PIX_FMT_NV21;
 
     s->avctx = avctx;
     ret = ff_v4l2_m2m_codec_init(priv);
@@ -517,7 +526,7 @@ static const AVOption mjpeg_dec_options[] = {
         CODEC_LONG_NAME("V4L2 mem2mem " LONGNAME " decoder wrapper"), \
         .p.type         = AVMEDIA_TYPE_VIDEO, \
         .p.id           = CODEC , \
-        .priv_data_size = sizeof(V4L2m2mPriv), \
+        .priv_data_size = sizeof(V4L2JpegDecContext), \
         .p.priv_class   = &v4l2_m2m_ ## NAME ## _dec_class, \
         .init           = v4l2_decode_init, \
         FF_CODEC_RECEIVE_FRAME_CB(v4l2_receive_frame), \

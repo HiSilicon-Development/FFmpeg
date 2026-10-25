@@ -315,9 +315,12 @@ start:
     if (V4L2_TYPE_IS_OUTPUT(ctx->type))
         pfd.events =  POLLOUT | POLLWRNORM;
     else {
-        /* no need to listen to requests for more input while draining */
-        if (ctx_to_m2mctx(ctx)->draining)
-            pfd.events =  POLLIN | POLLRDNORM | POLLPRI;
+        /* Independent JPEG pictures have no delayed output and must wait for
+         * their capture completion, not merely an available input buffer. */
+        if (ctx_to_m2mctx(ctx)->draining ||
+            (logger(ctx)->codec_id == AV_CODEC_ID_MJPEG &&
+             av_codec_is_decoder(logger(ctx)->codec)))
+            pfd.events = POLLIN | POLLRDNORM | POLLPRI;
     }
 
     for (;;) {
@@ -500,9 +503,23 @@ static inline int v4l2_try_raw_format(V4L2Context* ctx, enum AVPixelFormat pixfm
     }
 
     fmt->type = ctx->type;
+    if (V4L2_TYPE_IS_MULTIPLANAR(ctx->type)) {
+        fmt->fmt.pix_mp.width = ctx->width;
+        fmt->fmt.pix_mp.height = ctx->height;
+    } else {
+        fmt->fmt.pix.width = ctx->width;
+        fmt->fmt.pix.height = ctx->height;
+    }
 
     ret = ioctl(ctx_to_m2mctx(ctx)->fd, VIDIOC_TRY_FMT, fmt);
     if (ret)
+        return AVERROR(EINVAL);
+
+    /* TRY_FMT may silently substitute a different memory layout. */
+    if (ff_v4l2_format_v4l2_to_avfmt(
+            V4L2_TYPE_IS_MULTIPLANAR(ctx->type) ?
+            fmt->fmt.pix_mp.pixelformat : fmt->fmt.pix.pixelformat,
+            AV_CODEC_ID_RAWVIDEO) != pixfmt)
         return AVERROR(EINVAL);
 
     return 0;
@@ -519,8 +536,10 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
 
     if (pixfmt != AV_PIX_FMT_NONE) {
         ret = v4l2_try_raw_format(ctx, pixfmt);
-        if (!ret)
+        if (!ret) {
+            *p = pixfmt;
             return 0;
+        }
     }
 
     for (;;) {
@@ -546,15 +565,9 @@ static int v4l2_get_raw_format(V4L2Context* ctx, enum AVPixelFormat *p)
 static int v4l2_get_coded_format(V4L2Context* ctx, uint32_t *p)
 {
     struct v4l2_fmtdesc fdesc;
-    uint32_t v4l2_fmt;
     int ret;
 
-    /* translate to a valid v4l2 format */
-    v4l2_fmt = ff_v4l2_format_avcodec_to_v4l2(ctx->av_codec_id);
-    if (!v4l2_fmt)
-        return AVERROR(EINVAL);
-
-    /* check if the driver supports this format */
+    /* Match the driver's coded fourcc, including codec format aliases. */
     memset(&fdesc, 0, sizeof(fdesc));
     fdesc.type = ctx->type;
 
@@ -563,13 +576,13 @@ static int v4l2_get_coded_format(V4L2Context* ctx, uint32_t *p)
         if (ret)
             return AVERROR(EINVAL);
 
-        if (fdesc.pixelformat == v4l2_fmt)
+        if (ff_v4l2_format_v4l2_to_avcodec(fdesc.pixelformat) == ctx->av_codec_id)
             break;
 
         fdesc.index++;
     }
 
-    *p = v4l2_fmt;
+    *p = fdesc.pixelformat;
 
     return 0;
 }
@@ -661,6 +674,12 @@ int ff_v4l2_context_dequeue_frame(V4L2Context* ctx, AVFrame* frame, int timeout)
             return AVERROR_EOF;
 
         return AVERROR(EAGAIN);
+    }
+    if (logger(ctx)->codec_id == AV_CODEC_ID_MJPEG &&
+        (avbuf->buf.flags & V4L2_BUF_FLAG_ERROR)) {
+        av_log(logger(ctx), AV_LOG_ERROR, "JPEG hardware rejected the picture\n");
+        ff_v4l2_buffer_enqueue(avbuf);
+        return AVERROR_INVALIDDATA;
     }
 
     return ff_v4l2_buffer_buf_to_avframe(frame, avbuf);
