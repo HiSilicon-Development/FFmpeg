@@ -372,6 +372,8 @@ static av_cold int h264_decode_end(AVCodecContext *avctx)
     ff_h264_ps_uninit(&h->ps);
 
     ff_h2645_packet_uninit(&h->pkt);
+    av_buffer_unref(&h->mvc_subsps);
+    av_refstruct_unref(&h->mvc_sps);
 
     h264_free_pic(h, &h->cur_pic);
     h264_free_pic(h, &h->last_pic_for_ec);
@@ -477,6 +479,10 @@ static av_cold void h264_decode_flush(AVCodecContext *avctx)
 {
     H264Context *h = avctx->priv_data;
     int i;
+    memset(h->mvc_view, 0, sizeof(h->mvc_view));
+    h->mvc_initialized = 0;
+    h->mvc_active_view = 0;
+    h->mvc_base = NULL;
 
     memset(h->delayed_pic, 0, sizeof(h->delayed_pic));
 
@@ -580,6 +586,85 @@ static void debug_green_metadata(const H264SEIGreenMetaData *gm, void *logctx)
     }
 }
 
+#define MVC_STATE_FIELDS(M) \
+    M(poc) M(short_ref) M(long_ref) M(delayed_pic) M(next_output_pic) \
+    M(last_pocs) M(next_outputed_poc) M(short_ref_count) M(long_ref_count) \
+    M(mmco_reset) M(recovery_frame) M(frame_recovered) M(prev_interlaced_frame)
+
+static void mvc_save_view(H264Context *h)
+{
+    H264MVCViewState *v = &h->mvc_view[h->mvc_active_view];
+#define SAVE(f) memcpy(&v->f, &h->f, sizeof(v->f));
+    MVC_STATE_FIELDS(SAVE)
+#undef SAVE
+}
+
+static void mvc_load_view(H264Context *h, int view)
+{
+    const H264MVCViewState *v = &h->mvc_view[view];
+#define LOAD(f) memcpy(&h->f, &v->f, sizeof(h->f));
+    MVC_STATE_FIELDS(LOAD)
+#undef LOAD
+    h->mvc_active_view = view;
+    h->first_field = 0;
+}
+#undef MVC_STATE_FIELDS
+
+static void mvc_switch_view(H264Context *h, int view)
+{
+    if (!h->mvc_initialized) {
+        H264MVCViewState *v = &h->mvc_view[1];
+        v->poc.prev_frame_num = -1;
+        v->poc.prev_poc_msb = 1 << 16;
+        v->poc.prev_poc_lsb = -1;
+        v->next_outputed_poc = INT_MIN;
+        v->recovery_frame = -1;
+        for (int i = 0; i < FF_ARRAY_ELEMS(v->last_pocs); i++)
+            v->last_pocs[i] = INT_MIN;
+        h->mvc_initialized = 1;
+    }
+    if (view != h->mvc_active_view) {
+        mvc_save_view(h);
+        mvc_load_view(h, view);
+    }
+}
+
+static int mvc_subset_sps(H264Context *h, H2645NAL *nal)
+{
+    GetBitContext gb = nal->gb, id_gb = gb;
+    AVBufferRef *raw;
+    unsigned int id;
+    int ret;
+
+    if (!h->mvc) {
+        av_log(h->avctx, AV_LOG_ERROR, "MVC requires -mvc 1 -threads 1 and h264_v4l2request\n");
+        return AVERROR(ENOSYS);
+    }
+    if (h->avctx->active_thread_type || h->avctx->thread_count > 1)
+        return AVERROR(ENOSYS);
+    skip_bits(&id_gb, 24);
+    id = get_ue_golomb_31(&id_gb);
+    ret = ff_h264_decode_subset_sps(&gb, h->avctx, &h->ps);
+    if (ret < 0)
+        return ret;
+    raw = av_buffer_alloc(nal->raw_size);
+    if (!raw)
+        return AVERROR(ENOMEM);
+    memcpy(raw->data, nal->raw_data, nal->raw_size);
+    av_buffer_unref(&h->mvc_subsps);
+    h->mvc_subsps = raw;
+    av_refstruct_replace(&h->mvc_sps, h->ps.sps_list[id]);
+    if (!h->view_ids_available) {
+        h->view_ids_available = av_malloc_array(2, sizeof(*h->view_ids_available));
+        if (!h->view_ids_available)
+            return AVERROR(ENOMEM);
+    }
+    for (int i = 0; i < 2; i++)
+        h->view_ids_available[i] = h->mvc_sps->mvc_view_id[i];
+    h->nb_view_ids_available = 2;
+    return 0;
+}
+
 static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
                             const uint8_t *buf, int buf_size)
 {
@@ -587,6 +672,7 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
     int nals_needed = 0; ///< number of NALs that need decoding before the next frame thread starts
     int idr_cleared=0;
     int i, ret = 0;
+    int packet_view = -1;
 
     h->has_slice = 0;
     h->nal_unit_type= 0;
@@ -622,6 +708,38 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
     for (i = 0; i < h->pkt.nb_nals; i++) {
         H2645NAL *nal = &h->pkt.nals[i];
         int max_slice_ctx, err;
+        if (nal->type == H264_NAL_EXTEN_SLICE ||
+            (h->mvc_sps && (nal->type == H264_NAL_SLICE || nal->type == H264_NAL_IDR_SLICE))) {
+            int view = 0, anchor, interview;
+            if (!h->mvc || !h->mvc_sps)
+                return AVERROR_INVALIDDATA;
+            if (nal->type == H264_NAL_EXTEN_SLICE) {
+                unsigned int ext;
+                if (get_bits_left(&nal->gb) < 24)
+                    return AVERROR_INVALIDDATA;
+                ext = get_bits(&nal->gb, 24);
+                if ((ext & 0x800000) || !(ext & 1))
+                    return AVERROR_PATCHWELCOME;
+                view = (ext >> 6) & 1023;
+                if (view != h->mvc_sps->mvc_view_id[1])
+                    return AVERROR_INVALIDDATA;
+                view = 1;
+                anchor = (ext >> 2) & 1;
+                interview = (ext >> 1) & 1;
+                nal->type = ext & 0x400000 ? H264_NAL_SLICE : H264_NAL_IDR_SLICE;
+            } else {
+                anchor = nal->type == H264_NAL_IDR_SLICE;
+                interview = 1;
+            }
+            if (packet_view >= 0 && packet_view != view) {
+                av_log(avctx, AV_LOG_ERROR, "MVC needs one view picture per packet; use raw H264 parser\n");
+                return AVERROR_INVALIDDATA;
+            }
+            packet_view = view;
+            mvc_switch_view(h, view);
+            h->mvc_anchor_pic = anchor;
+            h->mvc_inter_view = interview;
+        }
 
         if (avctx->skip_frame >= AVDISCARD_NONREF &&
             nal->ref_idc == 0 && nal->type != H264_NAL_SEI)
@@ -634,7 +752,8 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
         err = 0;
         switch (nal->type) {
         case H264_NAL_IDR_SLICE:
-            if ((nal->data[1] & 0xFC) == 0x98) {
+            if ((nal->raw_data[0] & 31) != H264_NAL_EXTEN_SLICE &&
+                (nal->data[1] & 0xFC) == 0x98) {
                 av_log(h->avctx, AV_LOG_ERROR, "Invalid inter IDR frame\n");
                 h->next_outputed_poc = INT_MIN;
                 ret = -1;
@@ -656,6 +775,21 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             }
 
             if (h->current_slice == 1) {
+                if (h->mvc_sps && (!avctx->hwaccel ||
+                    strcmp(avctx->hwaccel->name, "h264_v4l2request"))) {
+                    av_log(avctx, AV_LOG_ERROR, "MVC requires the V4L2 request accelerator\n");
+                    ret = AVERROR(ENOSYS);
+                    goto end;
+                }
+                if (h->mvc_sps && FIELD_PICTURE(h)) {
+                    ret = AVERROR_PATCHWELCOME;
+                    goto end;
+                }
+                if (h->mvc_sps && h->mvc_active_view &&
+                    (!h->mvc_base || h->mvc_base->mvc_frame_num != h->poc.frame_num)) {
+                    ret = AVERROR_INVALIDDATA;
+                    goto end;
+                }
                 if (avctx->active_thread_type & FF_THREAD_FRAME &&
                     i >= nals_needed && !h->setup_finished && h->cur_pic_ptr) {
                     ff_thread_finish_setup(avctx);
@@ -714,6 +848,13 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
             ff_h264_decode_seq_parameter_set(&nal->gb, avctx, &h->ps, 1);
             break;
         }
+        case H264_NAL_SUB_SPS:
+            ret = mvc_subset_sps(h, nal);
+            if (ret < 0)
+                goto end;
+            break;
+        case H264_NAL_PREFIX:
+            break;
         case H264_NAL_PPS:
             if (FF_HW_HAS_CB(avctx, decode_params)) {
                 ret = FF_HW_CALL(avctx, decode_params,
@@ -864,6 +1005,14 @@ static int output_frame(H264Context *h, AVFrame *dst, H264Picture *srcp)
     ret = av_frame_ref(dst, srcp->needs_fg ? srcp->f_grain : srcp->f);
     if (ret < 0)
         return ret;
+    if (h->mvc_sps) {
+        AVFrameSideData *sd = av_frame_get_side_data(dst, AV_FRAME_DATA_VIEW_ID);
+        if (!sd)
+            sd = av_frame_new_side_data(dst, AV_FRAME_DATA_VIEW_ID, sizeof(int));
+        if (!sd)
+            return AVERROR(ENOMEM);
+        *(int *)sd->data = srcp->mvc_view_id;
+    }
 
     if (srcp->needs_fg && (ret = av_frame_copy_props(dst, srcp->f)) < 0)
         return ret;
@@ -923,6 +1072,14 @@ static int is_avcc_extradata(const uint8_t *buf, int buf_size)
 static int finalize_frame(H264Context *h, AVFrame *dst, H264Picture *out, int *got_frame)
 {
     int ret;
+    if (h->mvc_sps && h->nb_view_ids &&
+        !(h->nb_view_ids == 1 && h->view_ids[0] == -1)) {
+        int selected = 0;
+        for (unsigned int i = 0; i < h->nb_view_ids; i++)
+            selected |= h->view_ids[i] == out->mvc_view_id;
+        if (!selected)
+            return 0;
+    }
 
     if (((h->avctx->flags & AV_CODEC_FLAG_OUTPUT_CORRUPT) ||
          (h->avctx->flags2 & AV_CODEC_FLAG2_SHOW_ALL) ||
@@ -1032,8 +1189,23 @@ static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
     ff_h264_unref_picture(&h->last_pic_for_ec);
 
     /* end of stream, output what is still in the buffers */
-    if (buf_size == 0)
+    if (buf_size == 0) {
+        if (h->mvc_initialized) {
+            mvc_save_view(h);
+            /* Drain both independent display queues, preserving each view's
+             * POC ordering. Ties are emitted in view order. */
+            for (int view = 0; view < 2; view++) {
+                mvc_load_view(h, view);
+                ret = send_next_delayed_frame(h, pict, got_frame, 0);
+                mvc_save_view(h);
+                if (ret < 0 || *got_frame)
+                    return ret;
+            }
+            h->mvc_base = NULL;
+            return 0;
+        }
         return send_next_delayed_frame(h, pict, got_frame, 0);
+    }
 
     if (av_packet_get_side_data(avpkt, AV_PKT_DATA_NEW_EXTRADATA, NULL)) {
         size_t side_size;
@@ -1070,6 +1242,12 @@ static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
         (h->mb_y >= h->mb_height && h->mb_height)) {
         if ((ret = ff_h264_field_end(h, &h->slice_ctx[0], 0)) < 0)
             return ret;
+        if (h->mvc_sps) {
+            if (h->mvc_active_view)
+                h->mvc_base = NULL;
+            else if (h->mvc_inter_view)
+                h->mvc_base = h->cur_pic_ptr;
+        }
 
         /* Wait for second field. */
         if (h->next_output_pic) {
@@ -1096,6 +1274,13 @@ static const AVOption h264_options[] = {
     { "x264_build", "Assume this x264 version if no x264 version found in any SEI", OFFSET(x264_build), AV_OPT_TYPE_INT, {.i64 = -1}, -1, INT_MAX, VD },
     { "skip_gray", "Do not return gray gap frames", OFFSET(skip_gray), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "noref_gray", "Avoid using gray gap frames as references", OFFSET(noref_gray), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, VD },
+    { "mvc", "Decode both Annex-G MVC views with V4L2 request", OFFSET(mvc), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+    { "view_ids", "MVC view IDs to output; -1 outputs both views",
+      .offset = OFFSET(view_ids), .type = AV_OPT_TYPE_INT | AV_OPT_TYPE_FLAG_ARRAY,
+      .min = -1, .max = 1023, .flags = VD },
+    { "view_ids_available", "Available MVC view IDs",
+      .offset = OFFSET(view_ids_available), .type = AV_OPT_TYPE_UINT | AV_OPT_TYPE_FLAG_ARRAY,
+      .flags = VD | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
     { NULL },
 };
 

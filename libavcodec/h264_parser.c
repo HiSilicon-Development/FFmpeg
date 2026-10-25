@@ -65,6 +65,8 @@ typedef struct H264ParseContext {
     uint8_t parse_history[6];
     int parse_history_count;
     int parse_last_mb;
+    int parse_extension_left;
+    int parse_nal_extra;
     int64_t reference_dts;
     int last_frame_num, last_picture_structure;
 } H264ParseContext;
@@ -124,18 +126,25 @@ static int h264_find_frame_end(H264ParseContext *p, const uint8_t *buf,
         } else if (state <= 5) {
             int nalu_type = buf[i] & 0x1F;
             if (nalu_type == H264_NAL_SEI || nalu_type == H264_NAL_SPS ||
+                nalu_type == H264_NAL_SUB_SPS ||
                 nalu_type == H264_NAL_PPS || nalu_type == H264_NAL_AUD) {
                 if (pc->frame_start_found) {
                     i++;
                     goto found;
                 }
             } else if (nalu_type == H264_NAL_SLICE || nalu_type == H264_NAL_DPA ||
-                       nalu_type == H264_NAL_IDR_SLICE) {
+                       nalu_type == H264_NAL_IDR_SLICE || nalu_type == H264_NAL_EXTEN_SLICE) {
+                p->parse_nal_extra = nalu_type == H264_NAL_EXTEN_SLICE ? 3 : 0;
+                p->parse_extension_left = p->parse_nal_extra;
                 state += 8;
                 continue;
             }
             state = 7;
         } else {
+            if (p->parse_extension_left) {
+                p->parse_extension_left--;
+                continue;
+            }
             unsigned int mb, last_mb = p->parse_last_mb;
             GetBitContext gb;
             p->parse_history[p->parse_history_count++] = buf[i];
@@ -146,7 +155,7 @@ static int h264_find_frame_end(H264ParseContext *p, const uint8_t *buf,
                 p->parse_last_mb = mb;
                 if (pc->frame_start_found) {
                     if (mb <= last_mb) {
-                        i -= p->parse_history_count - 1;
+                        i -= p->parse_history_count - 1 + p->parse_nal_extra;
                         p->parse_history_count = 0;
                         goto found;
                     }
@@ -196,6 +205,10 @@ static int scan_mmco_reset(AVCodecParserContext *s, GetBitContext *gb,
                 int index;
                 for (index = 0; ; index++) {
                     unsigned int reordering_of_pic_nums_idc = get_ue_golomb_31(gb);
+                    if (reordering_of_pic_nums_idc == 4 || reordering_of_pic_nums_idc == 5) {
+                        get_ue_golomb_long(gb);
+                        continue;
+                    }
 
                     if (reordering_of_pic_nums_idc < 3)
                         get_ue_golomb_long(gb);
@@ -314,6 +327,7 @@ static inline int parse_nal_units(AVCodecParserContext *s,
         switch (state & 0x1f) {
         case H264_NAL_SLICE:
         case H264_NAL_IDR_SLICE:
+        case H264_NAL_EXTEN_SLICE:
             // Do not walk the whole buffer just to decode slice header
             if ((state & 0x1f) == H264_NAL_IDR_SLICE || ((state >> 5) & 0x3) == 0) {
                 /* IDR or disposable slice
@@ -340,9 +354,21 @@ static inline int parse_nal_units(AVCodecParserContext *s,
         nal.ref_idc = get_bits(&nal.gb, 2);
         nal.type    = get_bits(&nal.gb, 5);
 
+        if (nal.type == H264_NAL_EXTEN_SLICE) {
+            unsigned int ext;
+            if (get_bits_left(&nal.gb) < 24)
+                goto fail;
+            ext = get_bits(&nal.gb, 24);
+            if ((ext & 0x800000) || !(ext & 1))
+                goto fail;
+            nal.type = ext & 0x400000 ? H264_NAL_SLICE : H264_NAL_IDR_SLICE;
+        }
         switch (nal.type) {
         case H264_NAL_SPS:
             ff_h264_decode_seq_parameter_set(&nal.gb, avctx, &p->ps, 0);
+            break;
+        case H264_NAL_SUB_SPS:
+            ff_h264_decode_subset_sps(&nal.gb, avctx, &p->ps);
             break;
         case H264_NAL_PPS:
             ff_h264_decode_picture_parameter_set(&nal.gb, avctx, &p->ps,

@@ -88,25 +88,41 @@ static void fill_dpb_entry(struct v4l2_h264_dpb_entry *entry,
         entry->bottom_field_order_cnt = pic->field_poc[1];
 }
 
-static void fill_dpb(struct v4l2_ctrl_h264_decode_params *decode_params,
+static int fill_dpb(struct v4l2_ctrl_h264_decode_params *decode_params,
                      const H264Context *h)
 {
     int entries = 0;
 
     for (int i = 0; i < h->short_ref_count; i++) {
         const H264Picture *pic = h->short_ref[i];
-        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX))
+        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX)) {
+            if (entries == FF_ARRAY_ELEMS(decode_params->dpb))
+                return AVERROR(ENOSPC);
             fill_dpb_entry(&decode_params->dpb[entries++], pic, pic->pic_id);
+        }
     }
-
-    if (!h->long_ref_count)
-        return;
 
     for (int i = 0; i < FF_ARRAY_ELEMS(h->long_ref); i++) {
         const H264Picture *pic = h->long_ref[i];
-        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX))
+        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX)) {
+            if (entries == FF_ARRAY_ELEMS(decode_params->dpb))
+                return AVERROR(ENOSPC);
             fill_dpb_entry(&decode_params->dpb[entries++], pic, i);
+        }
     }
+    if (h->mvc_sps && h->mvc_active_view && h->mvc_base && h->slice_ctx[0].list_count &&
+        (h->mvc_anchor_pic ? h->mvc_sps->mvc_anchor_ref[0] || h->mvc_sps->mvc_anchor_ref[1] :
+                             h->mvc_sps->mvc_non_anchor_ref[0] || h->mvc_sps->mvc_non_anchor_ref[1])) {
+        struct v4l2_h264_dpb_entry *entry;
+        if (entries == FF_ARRAY_ELEMS(decode_params->dpb))
+            return AVERROR(ENOSPC);
+        entry = &decode_params->dpb[entries];
+        fill_dpb_entry(entry, h->mvc_base, h->mvc_base->pic_id);
+        /* A non-temporal base picture is still an inter-view reference. */
+        entry->fields = V4L2_H264_FRAME_REF;
+        entry->flags = V4L2_H264_DPB_ENTRY_FLAG_VALID | V4L2_H264_DPB_ENTRY_FLAG_ACTIVE;
+    }
+    return 0;
 }
 
 static void fill_ref_list(struct v4l2_h264_reference *reference,
@@ -301,7 +317,9 @@ static int v4l2_request_h264_start_frame(AVCodecContext *avctx,
         controls->decode_params.flags |= V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
 #endif
 
-    fill_dpb(&controls->decode_params, h);
+    ret = fill_dpb(&controls->decode_params, h);
+    if (ret < 0)
+        return ret;
 
     controls->first_slice = true;
     controls->num_slices = 0;
@@ -378,6 +396,18 @@ static int v4l2_request_h264_decode_slice(AVCodecContext *avctx,
         controls->first_slice = 0;
     }
 
+    if (h->mvc_sps && controls->first_slice && h->mvc_subsps) {
+        /* Parameter NAL plus the actual type-20/base slice, both Annex B.
+         * header_bit_size below remains relative to the slice NAL. */
+        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
+                                           nalu_slice_start_code, 3);
+        if (ret)
+            return ret;
+        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
+                                           h->mvc_subsps->data, h->mvc_subsps->size);
+        if (ret)
+            return ret;
+    }
     if (ctx->start_code == V4L2_STATELESS_H264_START_CODE_ANNEX_B) {
         ret = ff_v4l2_request_append_output(avctx, &controls->pic,
                                             nalu_slice_start_code, 3);
@@ -475,6 +505,11 @@ static int v4l2_request_h264_post_probe(AVCodecContext *avctx)
         return AVERROR(EINVAL);
     }
 
+    if (((const H264Context *)avctx->priv_data)->mvc) {
+        if (ctx->decode_mode != V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED)
+            return AVERROR(ENOSYS);
+        ctx->start_code = V4L2_STATELESS_H264_START_CODE_ANNEX_B;
+    }
     // TODO: check V4L2_CID_MPEG_VIDEO_H264_PROFILE control
     // TODO: check V4L2_CID_MPEG_VIDEO_H264_LEVEL control
 

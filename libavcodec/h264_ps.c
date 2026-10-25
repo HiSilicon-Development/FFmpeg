@@ -575,6 +575,16 @@ int ff_h264_decode_seq_parameter_set(GetBitContext *gb, AVCodecContext *avctx,
                );
     }
 
+    /* Ordinary SPS parsing is also the prefix of subset SPS parsing. Keep
+     * the previously authenticated dependency extension until its new body
+     * is parsed, so an identical repeated subset does not invalidate PPSes. */
+    if (ps->sps_list[sps_id] && (profile_idc == 118 || profile_idc == 128)) {
+        const SPS *old = ps->sps_list[sps_id];
+        sps->mvc_num_views = old->mvc_num_views;
+        memcpy(sps->mvc_view_id, old->mvc_view_id, sizeof(sps->mvc_view_id));
+        memcpy(sps->mvc_anchor_ref, old->mvc_anchor_ref, sizeof(sps->mvc_anchor_ref));
+        memcpy(sps->mvc_non_anchor_ref, old->mvc_non_anchor_ref, sizeof(sps->mvc_non_anchor_ref));
+    }
     /* check if this is a repeat of an already parsed SPS, then keep the
      * original one.
      * otherwise drop all PPSes that depend on it */
@@ -591,6 +601,55 @@ int ff_h264_decode_seq_parameter_set(GetBitContext *gb, AVCodecContext *avctx,
 fail:
     av_refstruct_unref(&sps);
     return AVERROR_INVALIDDATA;
+}
+
+int ff_h264_decode_subset_sps(GetBitContext *gb, AVCodecContext *avctx,
+                              H264ParamSets *ps)
+{
+    GetBitContext start = *gb;
+    SPS *sps;
+    unsigned int id, count, ref;
+    int ret;
+
+    skip_bits(&start, 24);
+    id = get_ue_golomb_31(&start);
+    if (id >= MAX_SPS_COUNT)
+        return AVERROR_INVALIDDATA;
+    ret = ff_h264_decode_seq_parameter_set(gb, avctx, ps, 0);
+    if (ret < 0)
+        return ret;
+    sps = (SPS *)ps->sps_list[id];
+    if ((sps->profile_idc != 118 && sps->profile_idc != 128) ||
+        !get_bits1(gb) || get_ue_golomb_31(gb) != 1)
+        return AVERROR_PATCHWELCOME;
+    for (int i = 0; i < 2; i++) {
+        unsigned int view = get_ue_golomb_31(gb);
+        if (view > 1023 || (i && view == sps->mvc_view_id[0]))
+            return AVERROR_INVALIDDATA;
+        sps->mvc_view_id[i] = view;
+    }
+    for (int anchor = 1; anchor >= 0; anchor--) {
+        for (int list = 0; list < 2; list++) {
+            count = get_ue_golomb_31(gb);
+            if (count > 1)
+                return AVERROR_INVALIDDATA;
+            if (count) {
+                ref = get_ue_golomb_31(gb);
+                if (ref != sps->mvc_view_id[0])
+                    return AVERROR_INVALIDDATA;
+            }
+            if (anchor)
+                sps->mvc_anchor_ref[list] = count;
+            else
+                sps->mvc_non_anchor_ref[list] = count;
+        }
+    }
+    if (get_bits_left(gb) < 0)
+        return AVERROR_INVALIDDATA;
+    /* Level/operation-point and MVC VUI tables do not change decoding the
+     * selected two views; their trailing bits remain in the forwarded NAL. */
+    sps->mvc_num_views = 2;
+    return 0;
 }
 
 static void init_dequant8_coeff_table(PPS *pps, const SPS *sps)

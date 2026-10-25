@@ -43,6 +43,11 @@
  */
 typedef struct SPS {
     unsigned int sps_id;
+    /* Annex G two-view dependency tables, present only in subset SPS. */
+    int mvc_num_views;
+    uint16_t mvc_view_id[2];
+    uint8_t mvc_anchor_ref[2];
+    uint8_t mvc_non_anchor_ref[2];
     int profile_idc;
     int level_idc;
     int chroma_format_idc;
@@ -162,6 +167,8 @@ int ff_h264_get_profile(const SPS *sps);
  */
 int ff_h264_decode_seq_parameter_set(GetBitContext *gb, AVCodecContext *avctx,
                                      H264ParamSets *ps, int ignore_truncation);
+int ff_h264_decode_subset_sps(GetBitContext *gb, AVCodecContext *avctx,
+                              H264ParamSets *ps);
 
 /**
  * Decode PPS

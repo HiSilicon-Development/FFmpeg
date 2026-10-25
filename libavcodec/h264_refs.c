@@ -130,6 +130,25 @@ static int mismatches_ref(const H264Context *h, const H264Picture *pic)
             h->cur_pic_ptr->f->format != f->format);
 }
 
+static int mvc_append_ref(H264Context *h, H264Ref *list, int len, int which)
+{
+    const SPS *sps = h->mvc_sps;
+    const H264Picture *base = h->mvc_base;
+    int count;
+
+    if (!h->mvc || !sps || !h->mvc_active_view)
+        return len;
+    count = h->mvc_anchor_pic ? sps->mvc_anchor_ref[which] :
+                               sps->mvc_non_anchor_ref[which];
+    if (count && base && len < 32) {
+        ref_from_h264pic(&list[len], base);
+        /* Inter-view eligibility is independent of temporal reference marking. */
+        list[len].reference = PICT_FRAME;
+        len++;
+    }
+    return len;
+}
+
 static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
 {
     int len;
@@ -155,6 +174,7 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
                                   FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
                                   h->long_ref, 16, 1, h->picture_structure);
             av_assert0(len <= 32);
+            len = mvc_append_ref(h, sl->ref_list[list], len, list);
 
             memset(&sl->ref_list[list][len], 0, sizeof(H264Ref) * (32 - len));
             lens[list] = len;
@@ -176,6 +196,7 @@ static void h264_initialise_ref_list(H264Context *h, H264SliceContext *sl)
                               FF_ARRAY_ELEMS(sl->ref_list[0]) - len,
                               h-> long_ref, 16, 1, h->picture_structure);
         av_assert0(len <= 32);
+        len = mvc_append_ref(h, sl->ref_list[0], len, 0);
 
         memset(&sl->ref_list[0][len], 0, sizeof(H264Ref) * (32 - len));
     }
@@ -298,6 +319,7 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
 
     for (int list = 0; list < sl->list_count; list++) {
         int pred = sl->curr_pic_num;
+        int view_pred = -1;
 
         for (int index = 0; index < sl->nb_ref_modifications[list]; index++) {
             unsigned int modification_of_pic_nums_idc = sl->ref_modifications[list][index].op;
@@ -359,6 +381,21 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                 }
                 break;
             }
+            case 4:
+            case 5:
+                if (!h->mvc || !h->mvc_active_view || !h->mvc_sps ||
+                    !h->mvc_base || val ||
+                    !(h->mvc_anchor_pic ? h->mvc_sps->mvc_anchor_ref[list] :
+                                         h->mvc_sps->mvc_non_anchor_ref[list]))
+                    return AVERROR_INVALIDDATA;
+                /* Annex G viewIdxPred wraps over this list's inter-view
+                 * reference-view indices. In the two-view case MaxViewIdx=1. */
+                view_pred = 0;
+                ref = h->mvc_base;
+                pic_id = ref->pic_id;
+                pic_structure = PICT_FRAME;
+                i = view_pred;
+                break;
             default:
                 av_assert0(0);
             }
@@ -375,6 +412,7 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
             } else {
                 for (i = index; i + 1 < sl->ref_count[list]; i++) {
                     if (sl->ref_list[list][i].parent &&
+                        ref->mvc_view_id == sl->ref_list[list][i].parent->mvc_view_id &&
                         ref->long_ref == sl->ref_list[list][i].parent->long_ref &&
                         pic_id        == sl->ref_list[list][i].pic_id)
                         break;
@@ -383,6 +421,8 @@ int ff_h264_build_ref_list(H264Context *h, H264SliceContext *sl)
                     sl->ref_list[list][i] = sl->ref_list[list][i - 1];
                 }
                 ref_from_h264pic(&sl->ref_list[list][index], ref);
+                if (modification_of_pic_nums_idc == 4 || modification_of_pic_nums_idc == 5)
+                    sl->ref_list[list][index].reference = PICT_FRAME;
                 if (FIELD_PICTURE(h)) {
                     pic_as_field(&sl->ref_list[list][index], pic_structure);
                 }
@@ -446,7 +486,7 @@ int ff_h264_decode_ref_pic_list_reordering(H264SliceContext *sl, void *logctx)
             if (index >= sl->ref_count[list]) {
                 av_log(logctx, AV_LOG_ERROR, "reference count overflow\n");
                 return AVERROR_INVALIDDATA;
-            } else if (op > 2) {
+            } else if (op > 5 || (op > 2 && !sl->h264->mvc)) {
                 av_log(logctx, AV_LOG_ERROR,
                        "illegal modification_of_pic_nums_idc %u\n",
                        op);

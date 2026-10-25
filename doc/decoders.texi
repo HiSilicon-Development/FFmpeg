@@ -38,6 +38,29 @@ Select an operating point of a scalable AV1 bitstream (0 - 31). Default is 0.
 
 @end table
 
+@section h264
+
+@subsection Two-view MVC with V4L2 requests
+
+The @option{mvc} option enables the Annex-G two-view input path for the
+@code{h264_v4l2request} accelerator. Use @option{-mvc 1 -threads 1} with a raw
+Annex-B H.264 stream containing the base and dependent view pictures in decoding
+order. Each parser packet must contain one view picture. The subset SPS and the
+actual type-20 extension headers identify the views; no private request control
+or base-view substitution is used. Both views are decoded and returned, with
+@code{AV_FRAME_DATA_VIEW_ID} on each output frame. The @option{view_ids} array
+selects output views (@code{-1} selects both); @option{view_ids_available}
+exports their stream-defined IDs. CLI view stream specifiers can route the
+views to different outputs.
+
+This path requires a kernel request decoder implementing MVC NAL ingress,
+combined per-view temporal/inter-view surface ownership, and final ordered
+reference lists in the standard H.264 controls. It accepts complete frame
+pictures; separate-field MVC pictures, SVC, more than two views, and pictures
+requiring more than sixteen combined request DPB entries are rejected. Ordinary
+H.264 decoding is unchanged when @option{mvc} is disabled. This is not the
+stateful @code{H264_MVC} format.
+
 @section hevc
 HEVC (AKA ITU-T H.265 or ISO/IEC 23008-2) decoder.
 

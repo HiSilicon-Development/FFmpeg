@@ -132,6 +132,8 @@ typedef struct H264Picture {
     int field_poc[2];       ///< top/bottom POC
     int poc;                ///< frame POC
     int frame_num;          ///< frame_num (raw frame_num from slice header)
+    int mvc_view_id;
+    int mvc_frame_num; /* Before MMCO 5 changes temporal frame_num. */
     int mmco_reset;         /**< MMCO_RESET set this 1. Reordering code must
                                  not mix pictures before and after MMCO_RESET. */
     int pic_id;             /**< pic_num (short -> no wrap version of pic_num,
@@ -337,9 +339,37 @@ typedef struct H264SliceContext {
 /**
  * H264Context
  */
+/* Only the active view occupies the ordinary H264 syntax state. The other
+ * view's reference marking, POC and display reorder queue remain banked;
+ * decoded pictures and the hardware request context are shared. */
+typedef struct H264MVCViewState {
+    H264POCContext poc;
+    H264Picture *short_ref[32], *long_ref[32];
+    H264Picture *delayed_pic[H264_MAX_DPB_FRAMES + 2];
+    H264Picture *next_output_pic;
+    int last_pocs[H264_MAX_DPB_FRAMES];
+    int next_outputed_poc;
+    int short_ref_count, long_ref_count;
+    int mmco_reset, recovery_frame, frame_recovered;
+    int prev_interlaced_frame;
+} H264MVCViewState;
+
 typedef struct H264Context {
     const AVClass *class;
     AVCodecContext *avctx;
+    int mvc;
+    int *view_ids;
+    unsigned nb_view_ids;
+    unsigned *view_ids_available;
+    unsigned nb_view_ids_available;
+    int mvc_active_view;
+    int mvc_initialized;
+    int mvc_anchor_pic;
+    int mvc_inter_view;
+    const SPS *mvc_sps; /* RefStruct reference */
+    AVBufferRef *mvc_subsps;
+    H264Picture *mvc_base;
+    H264MVCViewState mvc_view[2];
     VideoDSPContext vdsp;
     H264DSPContext h264dsp;
     H264ChromaContext h264chroma;

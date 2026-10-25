@@ -121,6 +121,7 @@ static void release_unused_pictures(H264Context *h, int remove_current)
     /* release non reference frames */
     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
         if (h->DPB[i].f->buf[0] && !h->DPB[i].reference &&
+            &h->DPB[i] != h->mvc_base &&
             (remove_current || &h->DPB[i] != h->cur_pic_ptr)) {
             ff_h264_unref_picture(&h->DPB[i]);
         }
@@ -197,6 +198,12 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
             return ret;
     }
 
+    if (h->mvc_sps) {
+        AVFrameSideData *sd = av_frame_new_side_data(pic->f, AV_FRAME_DATA_VIEW_ID, sizeof(int));
+        if (!sd)
+            return AVERROR(ENOMEM);
+        *(int *)sd->data = pic->mvc_view_id;
+    }
     pic->tf.f = pic->f;
     ret = ff_thread_get_ext_buffer(h->avctx, &pic->tf,
                                    pic->reference ? AV_GET_BUFFER_FLAG_REF : 0);
@@ -504,6 +511,8 @@ static int h264_frame_start(H264Context *h)
     pic->reference              = h->droppable ? 0 : h->picture_structure;
     pic->field_picture          = h->picture_structure != PICT_FRAME;
     pic->frame_num               = h->poc.frame_num;
+    pic->mvc_view_id = h->mvc_sps ? h->mvc_sps->mvc_view_id[h->mvc_active_view] : 0;
+    pic->mvc_frame_num = h->poc.frame_num;
     /*
      * Zero key_frame here; IDR markings per slice in frame or fields are ORed
      * in later.
@@ -1736,7 +1745,8 @@ static int h264_slice_header_parse(const H264Context *h, H264SliceContext *sl,
     sl->slice_type     = slice_type;
     sl->slice_type_nos = slice_type & 3;
 
-    if (nal->type  == H264_NAL_IDR_SLICE &&
+    if (nal->type == H264_NAL_IDR_SLICE &&
+        (nal->raw_data[0] & 31) != H264_NAL_EXTEN_SLICE &&
         sl->slice_type_nos != AV_PICTURE_TYPE_I) {
         av_log(h->avctx, AV_LOG_ERROR, "A non-intra slice in an IDR NAL unit.\n");
         return AVERROR_INVALIDDATA;

@@ -90,6 +90,8 @@ static void h264_copy_picture_params(H264Picture *dst, const H264Picture *src)
 
     dst->poc           = src->poc;
     dst->frame_num     = src->frame_num;
+    dst->mvc_view_id   = src->mvc_view_id;
+    dst->mvc_frame_num = src->mvc_frame_num;
     dst->mmco_reset    = src->mmco_reset;
     dst->long_ref      = src->long_ref;
     dst->mbaff         = src->mbaff;
