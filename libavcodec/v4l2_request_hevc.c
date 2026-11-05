@@ -803,6 +803,14 @@ static int v4l2_request_hevc_init(AVCodecContext *avctx)
     };
 
     fill_sps(&sps, h);
+    ctx->base.native_tiled_capture =
+        h->pps->sps->ptl.general_ptl.profile_idc == 2 &&
+        h->pps->sps->bit_depth == 10 &&
+        h->pps->sps->bit_depth_chroma == 10 &&
+        h->pps->sps->chroma_format_idc == 1 &&
+        h->pps->sps->ptl.general_ptl.progressive_source_flag &&
+        !h->pps->sps->ptl.general_ptl.interlaced_source_flag &&
+        !h->pps->sps->vui.field_seq_flag;
 
     ctx->base.post_probe = v4l2_request_hevc_post_probe;
     return ff_v4l2_request_init(avctx, V4L2_PIX_FMT_HEVC_SLICE,

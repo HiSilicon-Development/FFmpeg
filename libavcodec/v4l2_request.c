@@ -435,6 +435,8 @@ int ff_v4l2_request_frame_params(AVCodecContext *avctx,
         hwfc->height = ctx->format.fmt.pix.height;
         frames->bytesperline = ctx->format.fmt.pix.bytesperline;
     }
+    frames->coded_width = hwfc->width;
+    frames->coded_height = hwfc->height;
 
     if (!ctx->capture_ref) {
         int ret = v4l2_request_capture_context_init(ctx);

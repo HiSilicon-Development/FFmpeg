@@ -51,6 +51,9 @@ typedef struct AVV4L2RequestFramesContext {
     int bytesperline;
     /** Coded picture cadence from codec syntax, not a demux packet guess. */
     AVRational frame_rate;
+    /** Exact negotiated coded geometry; never inferred from visible crop. */
+    uint32_t coded_width;
+    uint32_t coded_height;
 } AVV4L2RequestFramesContext;
 
 /**
@@ -72,6 +75,14 @@ typedef struct AVV4L2RequestFrameDescriptor {
     int (*deinterlace)(const struct AVFrame *previous,
                        const struct AVFrame *current,
                        const struct AVFrame *next, struct AVFrame *output[2]);
+    /**
+     * Exact coded framebuffer dimensions for native tiled capture.
+     * AddFB2 must use these dimensions, not a cropped AVFrame size.
+     * Zero for capture layouts which do not require this metadata.
+     * This private extension requires matching producer/consumer headers.
+     */
+    uint32_t coded_width;
+    uint32_t coded_height;
 } AVV4L2RequestFrameDescriptor;
 
 #endif /* AVUTIL_HWCONTEXT_V4L2REQUEST_H */

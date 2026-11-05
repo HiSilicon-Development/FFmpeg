@@ -28,6 +28,7 @@
 #include <libudev.h>
 
 #include "libavutil/hwcontext_v4l2request.h"
+#include "libavutil/hwcontext_v4l2request_internal.h"
 #include "libavutil/mem.h"
 #include "v4l2_request_internal.h"
 
@@ -37,6 +38,10 @@ static const struct {
     uint32_t drm_format;
     uint64_t format_modifier;
 } v4l2_request_capture_pixelformats[] = {
+#if defined(V4L2_PIX_FMT_HISTB_TILED_10)
+    { V4L2_PIX_FMT_HISTB_TILED_10, AV_PIX_FMT_P010, DRM_FORMAT_YUV420_10BIT,
+      DRM_FORMAT_MOD_HISTB_VDH_10BIT },
+#endif
     { V4L2_PIX_FMT_NV12, AV_PIX_FMT_NV12, DRM_FORMAT_NV12, DRM_FORMAT_MOD_LINEAR },
 #if defined(V4L2_PIX_FMT_NV12_32L32)
     { V4L2_PIX_FMT_NV12_32L32, AV_PIX_FMT_NONE, DRM_FORMAT_NV12, DRM_FORMAT_MOD_ALLWINNER_TILED },
@@ -89,6 +94,15 @@ static const struct {
 #endif
 };
 
+static bool v4l2_request_is_ht10(uint32_t pixelformat)
+{
+#if defined(V4L2_PIX_FMT_HISTB_TILED_10)
+    return pixelformat == V4L2_PIX_FMT_HISTB_TILED_10;
+#else
+    return false;
+#endif
+}
+
 enum AVPixelFormat ff_v4l2_request_get_sw_format(struct v4l2_format *format)
 {
     uint32_t pixelformat = V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
@@ -138,6 +152,23 @@ int ff_v4l2_request_set_drm_descriptor(V4L2RequestFrameDescriptor *framedesc,
     layer->planes[0].pitch = V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
                              format->fmt.pix_mp.plane_fmt[0].bytesperline :
                              format->fmt.pix.bytesperline;
+
+    if (v4l2_request_is_ht10(pixelformat)) {
+        V4L2RequestHT10Layout layout;
+        uint32_t width = V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
+                         format->fmt.pix_mp.width : format->fmt.pix.width;
+        uint32_t height = V4L2_TYPE_IS_MULTIPLANAR(format->type) ?
+                          format->fmt.pix_mp.height : format->fmt.pix.height;
+
+        if (ff_v4l2request_ht10_layout(width, height, layer->planes[0].pitch,
+                                      desc->objects[0].size, &layout) < 0 ||
+            framedesc->capture.width != width ||
+            framedesc->capture.height != height)
+            return AVERROR(EINVAL);
+        framedesc->base.coded_width = width;
+        framedesc->base.coded_height = height;
+        return 0;
+    }
 
     // AFBC formats only use 1 plane, remaining use 2 planes
     if ((desc->objects[0].format_modifier >> 56) != DRM_FORMAT_MOD_VENDOR_ARM) {
@@ -254,8 +285,33 @@ static int v4l2_request_set_format(AVCodecContext *avctx,
         format.fmt.pix.sizeimage = buffersize;
     }
 
+    if (v4l2_request_is_ht10(pixelformat) && capture_size_override)
+        return AVERROR(EINVAL);
+
     if (ioctl(ctx->video_fd, VIDIOC_S_FMT, &format) < 0)
         return AVERROR(errno);
+
+    if (v4l2_request_is_ht10(pixelformat)) {
+        V4L2RequestHT10Layout layout;
+        unsigned int actual_width = V4L2_TYPE_IS_MULTIPLANAR(type) ?
+                                    format.fmt.pix_mp.width : format.fmt.pix.width;
+        unsigned int actual_height = V4L2_TYPE_IS_MULTIPLANAR(type) ?
+                                     format.fmt.pix_mp.height : format.fmt.pix.height;
+        unsigned int actual_format = V4L2_TYPE_IS_MULTIPLANAR(type) ?
+                                     format.fmt.pix_mp.pixelformat : format.fmt.pix.pixelformat;
+        unsigned int pitch = V4L2_TYPE_IS_MULTIPLANAR(type) ?
+                             format.fmt.pix_mp.plane_fmt[0].bytesperline :
+                             format.fmt.pix.bytesperline;
+        unsigned int size = V4L2_TYPE_IS_MULTIPLANAR(type) ?
+                            format.fmt.pix_mp.plane_fmt[0].sizeimage :
+                            format.fmt.pix.sizeimage;
+
+        if (actual_format != pixelformat || actual_width != width ||
+            actual_height != height ||
+            (V4L2_TYPE_IS_MULTIPLANAR(type) && format.fmt.pix_mp.num_planes != 1) ||
+            ff_v4l2request_ht10_layout(width, height, pitch, size, &layout) < 0)
+            return AVERROR(EINVAL);
+    }
 
     if (capture_size_override) {
         unsigned int actual_width = V4L2_TYPE_IS_MULTIPLANAR(type) ?
@@ -286,7 +342,8 @@ static int v4l2_request_select_capture_format(AVCodecContext *avctx)
 {
     V4L2RequestContext *ctx = v4l2_request_context(avctx);
     enum v4l2_buf_type type = ctx->format.type;
-    enum AVPixelFormat preferred_format = avctx->sw_pix_fmt;
+    enum AVPixelFormat preferred_formats[2] = { avctx->sw_pix_fmt };
+    int nb_preferred_formats = 1;
     bool require_preferred_format = false;
     struct v4l2_format format = {
         .type = type,
@@ -297,27 +354,55 @@ static int v4l2_request_select_capture_format(AVCodecContext *avctx)
     };
     uint32_t pixelformat;
 
-    /* Stateless decoders expose planar 10-bit software formats, while
-     * V4L2 capture devices commonly expose the equivalent P010 layout. */
-    if (preferred_format == AV_PIX_FMT_YUV420P10) {
+    /* Keep Main10 in ten bits. Native CV200 HT10 is preferred only when
+     * the codec and geometry prove its complete full-coded contract. */
+    if (avctx->sw_pix_fmt == AV_PIX_FMT_YUV420P10) {
         if (getenv("HISTB_V4L2REQUEST_MAIN10_NV12"))
-            preferred_format = AV_PIX_FMT_NV12;
+            preferred_formats[0] = AV_PIX_FMT_NV12;
         else {
-            preferred_format = AV_PIX_FMT_P010;
+            preferred_formats[0] = AV_PIX_FMT_P010;
+            /* Native NV15 requires complete four-sample groups and
+             * an even full height; keep other Main10 geometry in P010. */
+            if (!(avctx->coded_width % 4) && !(avctx->coded_height % 2)) {
+                preferred_formats[0] = AV_PIX_FMT_NV15;
+                preferred_formats[1] = AV_PIX_FMT_P010;
+                nb_preferred_formats = 2;
+            }
             require_preferred_format = true;
         }
     }
 
-    /* Prefer the capture layout matching the decoded bit depth.  In
-     * particular, a driver's default NV12 format is not valid for Main10. */
-    while (ioctl(ctx->video_fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
-        for (int i = 0; i < FF_ARRAY_ELEMS(v4l2_request_capture_pixelformats); i++) {
-            if (fmtdesc.pixelformat == v4l2_request_capture_pixelformats[i].pixelformat &&
-                preferred_format == v4l2_request_capture_pixelformats[i].sw_format)
+#if defined(V4L2_PIX_FMT_HISTB_TILED_10)
+    if (require_preferred_format && ctx->native_tiled_capture &&
+        avctx->codec_id == AV_CODEC_ID_HEVC &&
+        avctx->width == avctx->coded_width && avctx->height == avctx->coded_height &&
+        avctx->coded_width >= 64 && avctx->coded_width <= 4096 &&
+        avctx->coded_height >= 64 && avctx->coded_height <= 2160 &&
+        !(avctx->coded_width & 3) && !(avctx->coded_height & 1) &&
+        !getenv("HISTB_V4L2REQUEST_CAPTURE_SIZE") &&
+        !getenv("HISTB_V4L2REQUEST_MAX_CAPTURE_SIZE")) {
+        while (ioctl(ctx->video_fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
+            if (v4l2_request_is_ht10(fmtdesc.pixelformat))
                 return v4l2_request_set_format(avctx, type, fmtdesc.pixelformat, 0);
+            fmtdesc.index++;
         }
+    }
+#endif
 
-        fmtdesc.index++;
+    /* Enumerate separately for each preference so a driver's default or
+     * ENUM_FMT order cannot select P010 before an advertised NV15 layout. */
+    for (int p = 0; p < nb_preferred_formats; p++) {
+        fmtdesc.index = 0;
+        while (ioctl(ctx->video_fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
+            for (int i = 0; i < FF_ARRAY_ELEMS(v4l2_request_capture_pixelformats); i++) {
+                if (!v4l2_request_is_ht10(fmtdesc.pixelformat) &&
+                    fmtdesc.pixelformat == v4l2_request_capture_pixelformats[i].pixelformat &&
+                    preferred_formats[p] == v4l2_request_capture_pixelformats[i].sw_format)
+                    return v4l2_request_set_format(avctx, type, fmtdesc.pixelformat, 0);
+            }
+
+            fmtdesc.index++;
+        }
     }
 
     if (require_preferred_format)
@@ -335,14 +420,16 @@ static int v4l2_request_select_capture_format(AVCodecContext *avctx)
 
     // Use the driver preferred format when it is supported
     for (int i = 0; i < FF_ARRAY_ELEMS(v4l2_request_capture_pixelformats); i++) {
-        if (pixelformat == v4l2_request_capture_pixelformats[i].pixelformat)
+        if (!v4l2_request_is_ht10(pixelformat) &&
+            pixelformat == v4l2_request_capture_pixelformats[i].pixelformat)
             return v4l2_request_set_format(avctx, type, pixelformat, 0);
     }
 
     // Otherwise, use first format that is supported
     while (ioctl(ctx->video_fd, VIDIOC_ENUM_FMT, &fmtdesc) >= 0) {
         for (int i = 0; i < FF_ARRAY_ELEMS(v4l2_request_capture_pixelformats); i++) {
-            if (fmtdesc.pixelformat == v4l2_request_capture_pixelformats[i].pixelformat)
+            if (!v4l2_request_is_ht10(fmtdesc.pixelformat) &&
+                fmtdesc.pixelformat == v4l2_request_capture_pixelformats[i].pixelformat)
                 return v4l2_request_set_format(avctx, type, fmtdesc.pixelformat, 0);
         }
 

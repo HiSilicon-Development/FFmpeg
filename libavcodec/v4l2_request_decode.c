@@ -437,13 +437,18 @@ static int v4l2_request_post_process(void *logctx, AVFrame *frame)
     V4L2RequestContext *ctx = fdd->hwaccel_priv;
     bool defer = ctx->defer_capture_wait &&
         (!ctx->defer_capture_wait_auto ||
-         (!(frame->flags & AV_FRAME_FLAG_INTERLACED) &&
-          ff_v4l2_request_get_sw_format(&ctx->format) == AV_PIX_FMT_NV12));
+         !(frame->flags & AV_FRAME_FLAG_INTERLACED));
     int ret;
+
+    if (defer && ctx->defer_capture_wait_auto) {
+        enum AVPixelFormat sw_format = ff_v4l2_request_get_sw_format(&ctx->format);
+        defer = sw_format == AV_PIX_FMT_NV12 || sw_format == AV_PIX_FMT_NV15 ||
+                desc->base.coded_width != 0;
+    }
 
     /*
      * The normal path completes capture before publishing the frame. The
-     * opt-in pipeline publishes progressive NV12 frames with their wait
+     * opt-in pipeline publishes progressive NV12, NV15 and native HT10 frames with their wait
      * callback, including native-size output. Consumers must complete that
      * callback before accessing pixels or importing the DMA-BUF for rendering.
      * Interlaced auto mode still completes capture before temporal DEI.

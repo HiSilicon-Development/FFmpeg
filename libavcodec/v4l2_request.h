@@ -60,6 +60,8 @@ typedef struct V4L2RequestContext {
     bool defer_capture_wait;
     bool defer_capture_wait_auto;
     bool trace_pipeline;
+    /* Set only by HEVC after checking the active Main10 progressive SPS. */
+    bool native_tiled_capture;
 } V4L2RequestContext;
 
 typedef struct V4L2RequestPictureContext {
