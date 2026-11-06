@@ -706,7 +706,8 @@ static av_always_inline int get_chroma_qp(const PPS *pps, int t, int qscale)
     return pps->chroma_qp_table[t][qscale];
 }
 
-int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup);
+int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup,
+                      int hwaccel_error);
 
 int ff_h264_ref_picture(H264Picture *dst, const H264Picture *src);
 int ff_h264_replace_picture(H264Picture *dst, const H264Picture *src);

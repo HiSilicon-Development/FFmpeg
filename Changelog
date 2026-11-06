@@ -9,6 +9,7 @@ version 9.0.1:
  avcodec/v4l2_request: retain completion callbacks for native progressive NV12 in auto pipeline mode
  avcodec/v4l2_request: prefer advertised CV200 HT10 for proven progressive uncropped Main10, preserving linear compatibility paths
  avutil/v4l2request: export explicit native tiled DRM surfaces with coded geometry and read-only bit-exact P010 transfers/maps
+ avcodec/h264: finish parsed field POC/MMCO state after hardware start rejection without submitting an unstarted picture
  Bump for 9.0.1
  avcodec/lcldec: clear what the multithread chunks leave undecoded
  avformat/mlv: end the LJ92 packet where its data ends

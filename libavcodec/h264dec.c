@@ -798,8 +798,14 @@ static int decode_nal_units(H264Context *h, AVBufferRef *buf_ref,
 
                 if (h->avctx->hwaccel &&
                     (ret = FF_HW_CALL(h->avctx, start_frame, buf_ref,
-                                      buf, buf_size)) < 0)
+                                      buf, buf_size)) < 0) {
+                    /* The header is complete even when reconstruction cannot
+                     * start. Retain syntax state without submitting end_frame;
+                     * otherwise the next field invents another frame_num gap. */
+                    ff_h264_field_end(h, &h->slice_ctx[0], 0, ret);
+                    h->nb_slice_ctx_queued = 0;
                     goto end;
+                }
             }
 
             max_slice_ctx = avctx->hwaccel ? 1 : h->nb_slice_ctx;
@@ -1240,7 +1246,7 @@ static int h264_decode_frame(AVCodecContext *avctx, AVFrame *pict,
 
     if (!(avctx->flags2 & AV_CODEC_FLAG2_CHUNKS) ||
         (h->mb_y >= h->mb_height && h->mb_height)) {
-        if ((ret = ff_h264_field_end(h, &h->slice_ctx[0], 0)) < 0)
+        if ((ret = ff_h264_field_end(h, &h->slice_ctx[0], 0, 0)) < 0)
             return ret;
         if (h->mvc_sps) {
             if (h->mvc_active_view)

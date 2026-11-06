@@ -188,7 +188,8 @@ void ff_h264_set_erpic(ERPicture *dst, const H264Picture *src)
 #endif /* CONFIG_ERROR_RESILIENCE */
 }
 
-int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
+int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup,
+                      int hwaccel_error)
 {
     AVCodecContext *const avctx = h->avctx;
     H264Picture *cur = h->cur_pic_ptr;
@@ -206,7 +207,9 @@ int ff_h264_field_end(H264Context *h, H264SliceContext *sl, int in_setup)
     }
 
     if (avctx->hwaccel) {
-        err = FF_HW_SIMPLE_CALL(avctx, end_frame);
+        /* A rejected field still advances parsed POC/MMCO state. It must not
+         * submit an unstarted hardware picture or publish successful pixels. */
+        err = hwaccel_error < 0 ? hwaccel_error : FF_HW_SIMPLE_CALL(avctx, end_frame);
         if (err < 0)
             av_log(avctx, AV_LOG_ERROR,
                    "hardware accelerator failed to decode picture\n");

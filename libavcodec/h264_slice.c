@@ -2133,12 +2133,12 @@ int ff_h264_queue_decode_slice(H264Context *h, const H2645NAL *nal)
             }
 
             if (h->cur_pic_ptr && FIELD_PICTURE(h) && h->first_field) {
-                ret = ff_h264_field_end(h, h->slice_ctx, 1);
+                ret = ff_h264_field_end(h, h->slice_ctx, 1, 0);
                 if (ret < 0)
                     return ret;
             } else if (h->cur_pic_ptr && !FIELD_PICTURE(h) && !h->first_field && h->nal_unit_type  == H264_NAL_IDR_SLICE) {
                 av_log(h->avctx, AV_LOG_WARNING, "Broken frame packetizing\n");
-                ret = ff_h264_field_end(h, h->slice_ctx, 1);
+                ret = ff_h264_field_end(h, h->slice_ctx, 1, 0);
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 0);
                 ff_thread_report_progress(&h->cur_pic_ptr->tf, INT_MAX, 1);
                 h->cur_pic_ptr = NULL;
