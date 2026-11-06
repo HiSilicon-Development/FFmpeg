@@ -111,6 +111,13 @@ int ff_v4l2_request_reset_picture(AVCodecContext *avctx,
 int ff_v4l2_request_start_frame(AVCodecContext *avctx,
                                 V4L2RequestPictureContext *pic, AVFrame *frame);
 
+/* Invalidate completion even when start_frame was never reached. A known HOLD
+ * can be retired with quiescent stateless FLUSH; an uncertain queue failure
+ * stops both queues and returns an error requiring decoder reinitialization. */
+int ff_v4l2_request_abort_frame(AVCodecContext *avctx,
+                                V4L2RequestPictureContext *pic, AVFrame *frame,
+                                bool held, bool queue_failed);
+
 void ff_v4l2_request_flush(AVCodecContext *avctx);
 
 #endif /* AVCODEC_V4L2_REQUEST_H */

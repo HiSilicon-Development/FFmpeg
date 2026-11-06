@@ -543,6 +543,133 @@ int ff_v4l2_request_start_frame(AVCodecContext *avctx,
     return 0;
 }
 
+static int v4l2_request_failed_wait(void *opaque)
+{
+    return AVERROR_INVALIDDATA;
+}
+
+static int v4l2_request_failed_post_process(void *logctx, AVFrame *frame)
+{
+    return AVERROR_INVALIDDATA;
+}
+
+int ff_v4l2_request_abort_frame(AVCodecContext *avctx,
+                                V4L2RequestPictureContext *pic, AVFrame *frame,
+                                bool held, bool queue_failed)
+{
+    V4L2RequestContext *ctx = v4l2_request_context(avctx);
+    V4L2RequestContext *capture = v4l2_request_capture_context(ctx);
+    V4L2RequestFrameDescriptor *desc = v4l2_request_framedesc(frame);
+    FrameDecodeData *fdd = frame->private_ref;
+    struct v4l2_decoder_cmd cmd = { .cmd = V4L2_DEC_CMD_FLUSH };
+    struct pollfd pollfd = { .fd = ctx->video_fd, .events = POLLOUT };
+    uint64_t target;
+    int ret = AVERROR_INVALIDDATA;
+
+    if (!desc || !fdd)
+        return AVERROR(EINVAL);
+
+    /* A failed second field must override even the first field's callbacks.
+     * FLUSH can return partial CAPTURE as DONE, so kernel flags alone are not
+     * completion authority. QBUF of a genuinely new picture clears its bit. */
+    fdd->post_process = v4l2_request_failed_post_process;
+    desc->base.wait = v4l2_request_failed_wait;
+    desc->base.wait_opaque = NULL;
+    target = UINT64_C(1) << desc->capture.index;
+    atomic_fetch_or(&capture->capture_errors, target);
+    if (!held && !queue_failed)
+        return 0;
+
+    ff_mutex_lock(&ctx->mutex);
+    if (capture != ctx)
+        ff_mutex_lock(&capture->mutex);
+
+    if (queue_failed)
+        goto stop;
+
+    /* Only a successfully queued non-final slice establishes this contract.
+     * Drain REQUEST and OUTPUT before FLUSH: with pending source the kernel
+     * merely removes HOLD from that source, without retiring the held target.
+     * No empty slice, STOP/START, software flush or queue-mask timeout fiction
+     * can substitute for this stateless queue protocol. */
+    for (int i = 0; i < FF_ARRAY_ELEMS(ctx->output); i++) {
+        if (atomic_load(&ctx->queued_request) & (1U << i)) {
+            ret = v4l2_request_wait_on_request(ctx, &ctx->output[i]);
+            if (ret < 0)
+                goto stop;
+        }
+    }
+    while (atomic_load(&ctx->queued_output)) {
+        ret = v4l2_request_dequeue_buffer(ctx, ctx->output_type);
+        if (!ret)
+            continue;
+        if (ret != AVERROR(EAGAIN))
+            goto stop;
+        ret = poll(&pollfd, 1, 2000);
+        if (ret <= 0) {
+            ret = ret < 0 ? AVERROR(errno) : AVERROR(ETIMEDOUT);
+            goto stop;
+        }
+    }
+    if (pic->capture != &desc->capture ||
+        !(atomic_load(&capture->queued_capture) & target)) {
+        ret = AVERROR_INVALIDDATA;
+        goto stop;
+    }
+    if (ioctl(ctx->video_fd, VIDIOC_DECODER_CMD, &cmd) < 0) {
+        ret = AVERROR(errno);
+        goto stop;
+    }
+
+    pollfd.fd = capture->video_fd;
+    pollfd.events = POLLIN;
+    while (atomic_load(&capture->queued_capture) & target) {
+        ret = v4l2_request_dequeue_buffer(ctx, capture->format.type);
+        if (!ret)
+            continue;
+        if (ret != AVERROR(EAGAIN))
+            goto stop;
+        ret = poll(&pollfd, 1, 2000);
+        if (ret <= 0) {
+            ret = ret < 0 ? AVERROR(errno) : AVERROR(ETIMEDOUT);
+            goto stop;
+        }
+    }
+    ret = 0;
+    goto unlock;
+
+stop:
+    /* Partial QBUF/QUEUE failures have no provable held-target ownership.
+     * STREAMOFF is definitive cancellation, including IN_REQUEST OUTPUTs.
+     * It also invalidates driver reference storage: poison every capture,
+     * leave the decoder failed closed, and never automatically STREAMON. */
+    if (ret >= 0)
+        ret = AVERROR_INVALIDDATA;
+    atomic_store(&capture->capture_errors, UINT64_MAX);
+    av_log(ctx, AV_LOG_ERROR,
+           "Request transaction failed; stopping queues, decoder reinitialization required\n");
+    if (ioctl(ctx->video_fd, VIDIOC_STREAMOFF, &ctx->output_type) == 0)
+        atomic_store(&ctx->queued_output, 0);
+    else
+        av_log(ctx, AV_LOG_ERROR, "Failed to stop OUTPUT queue: %s\n", strerror(errno));
+    if (ioctl(capture->video_fd, VIDIOC_STREAMOFF, &capture->format.type) == 0)
+        atomic_store(&capture->queued_capture, 0);
+    else
+        av_log(ctx, AV_LOG_ERROR, "Failed to stop CAPTURE queue: %s\n", strerror(errno));
+    for (int i = 0; i < FF_ARRAY_ELEMS(ctx->output); i++) {
+        if (ioctl(ctx->output[i].fd, MEDIA_REQUEST_IOC_REINIT, NULL) == 0)
+            atomic_fetch_and(&ctx->queued_request, ~(1U << i));
+        else
+            av_log(ctx, AV_LOG_ERROR, "Failed to reinit canceled request %d: %s\n",
+                   ctx->output[i].fd, strerror(errno));
+    }
+unlock:
+    if (capture != ctx)
+        ff_mutex_unlock(&capture->mutex);
+    ff_mutex_unlock(&ctx->mutex);
+    return ret;
+}
+
 void ff_v4l2_request_flush(AVCodecContext *avctx)
 {
     V4L2RequestContext *ctx = v4l2_request_context(avctx);
