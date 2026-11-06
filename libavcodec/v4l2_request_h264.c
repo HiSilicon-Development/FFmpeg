@@ -22,12 +22,14 @@
 #include "hwaccel_internal.h"
 #include "hwconfig.h"
 #include "internal.h"
-#include "v4l2_request.h"
+#include "v4l2_request_internal.h"
 
 typedef struct V4L2RequestContextH264 {
     V4L2RequestContext base;
     enum v4l2_stateless_h264_decode_mode decode_mode;
     enum v4l2_stateless_h264_start_code start_code;
+    /* A failed queue teardown requires decoder reinitialization, not retry. */
+    int error;
 } V4L2RequestContextH264;
 
 typedef struct V4L2RequestControlsH264 {
@@ -41,6 +43,13 @@ typedef struct V4L2RequestControlsH264 {
     bool pred_weights_required;
     bool first_slice;
     int num_slices;
+    const H264Picture *dpb_pictures[V4L2_H264_NUM_DPB_ENTRIES];
+    /* State is per picture; submitted_fields survives the complementary field.
+     * An error invalidates the whole surface and is never cleared by start. */
+    unsigned int submitted_fields;
+    bool started;
+    bool held;
+    int error;
 } V4L2RequestControlsH264;
 
 static uint8_t nalu_slice_start_code[] = { 0x00, 0x00, 0x01 };
@@ -68,16 +77,41 @@ static void fill_weight_factors(struct v4l2_h264_weight_factors *weight_factors,
     }
 }
 
+static unsigned int reference_fields(const H264Picture *pic)
+{
+    const V4L2RequestControlsH264 *controls;
+    V4L2RequestFrameDescriptor *desc;
+    unsigned int fields;
+
+    if (!pic || !pic->f || !pic->hwaccel_picture_private || pic->invalid_gap ||
+        (pic->field_poc[0] == INT_MAX && pic->field_poc[1] == INT_MAX))
+        return 0;
+
+    controls = pic->hwaccel_picture_private;
+    desc = v4l2_request_framedesc(pic->f);
+    if (controls->error || !desc || !desc->ctx ||
+        (atomic_load(&desc->ctx->capture_errors) &
+         (UINT64_C(1) << desc->capture.index)))
+        return 0;
+
+    fields = controls->submitted_fields;
+    if (pic->field_poc[0] == INT_MAX)
+        fields &= ~V4L2_H264_TOP_FIELD_REF;
+    if (pic->field_poc[1] == INT_MAX)
+        fields &= ~V4L2_H264_BOTTOM_FIELD_REF;
+    return fields;
+}
+
 static void fill_dpb_entry(struct v4l2_h264_dpb_entry *entry,
-                           const H264Picture *pic, int long_idx)
+                           const H264Picture *pic, int long_idx,
+                           unsigned int fields)
 {
     entry->reference_ts = ff_v4l2_request_get_capture_timestamp(pic->f);
     entry->pic_num = pic->pic_id;
     entry->frame_num = pic->long_ref ? long_idx : pic->frame_num;
-    entry->fields = pic->reference & V4L2_H264_FRAME_REF;
-    entry->flags = V4L2_H264_DPB_ENTRY_FLAG_VALID;
-    if (entry->fields)
-        entry->flags |= V4L2_H264_DPB_ENTRY_FLAG_ACTIVE;
+    entry->fields = fields;
+    entry->flags = V4L2_H264_DPB_ENTRY_FLAG_VALID |
+                   V4L2_H264_DPB_ENTRY_FLAG_ACTIVE;
     if (pic->long_ref)
         entry->flags |= V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM;
     if (pic->field_picture)
@@ -88,63 +122,134 @@ static void fill_dpb_entry(struct v4l2_h264_dpb_entry *entry,
         entry->bottom_field_order_cnt = pic->field_poc[1];
 }
 
-static int fill_dpb(struct v4l2_ctrl_h264_decode_params *decode_params,
-                     const H264Context *h)
+static int fill_dpb(V4L2RequestControlsH264 *controls, const H264Context *h)
 {
+    struct v4l2_ctrl_h264_decode_params *decode_params = &controls->decode_params;
     int entries = 0;
 
+    memset(controls->dpb_pictures, 0, sizeof(controls->dpb_pictures));
     for (int i = 0; i < h->short_ref_count; i++) {
         const H264Picture *pic = h->short_ref[i];
-        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX)) {
+        unsigned int fields = reference_fields(pic);
+        if (pic)
+            fields &= pic->reference;
+        if (fields) {
             if (entries == FF_ARRAY_ELEMS(decode_params->dpb))
                 return AVERROR(ENOSPC);
-            fill_dpb_entry(&decode_params->dpb[entries++], pic, pic->pic_id);
+            controls->dpb_pictures[entries] = pic;
+            fill_dpb_entry(&decode_params->dpb[entries++], pic, pic->pic_id, fields);
         }
     }
 
     for (int i = 0; i < FF_ARRAY_ELEMS(h->long_ref); i++) {
         const H264Picture *pic = h->long_ref[i];
-        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX)) {
+        unsigned int fields = reference_fields(pic);
+        if (pic)
+            fields &= pic->reference;
+        if (fields) {
             if (entries == FF_ARRAY_ELEMS(decode_params->dpb))
                 return AVERROR(ENOSPC);
-            fill_dpb_entry(&decode_params->dpb[entries++], pic, i);
+            controls->dpb_pictures[entries] = pic;
+            fill_dpb_entry(&decode_params->dpb[entries++], pic, i, fields);
         }
     }
     if (h->mvc_sps && h->mvc_active_view && h->mvc_base && h->slice_ctx[0].list_count &&
         (h->mvc_anchor_pic ? h->mvc_sps->mvc_anchor_ref[0] || h->mvc_sps->mvc_anchor_ref[1] :
                              h->mvc_sps->mvc_non_anchor_ref[0] || h->mvc_sps->mvc_non_anchor_ref[1])) {
-        struct v4l2_h264_dpb_entry *entry;
+        unsigned int fields = reference_fields(h->mvc_base);
+        if (fields != V4L2_H264_FRAME_REF)
+            return AVERROR_INVALIDDATA;
         if (entries == FF_ARRAY_ELEMS(decode_params->dpb))
             return AVERROR(ENOSPC);
-        entry = &decode_params->dpb[entries];
-        fill_dpb_entry(entry, h->mvc_base, h->mvc_base->pic_id);
-        /* A non-temporal base picture is still an inter-view reference. */
-        entry->fields = V4L2_H264_FRAME_REF;
-        entry->flags = V4L2_H264_DPB_ENTRY_FLAG_VALID | V4L2_H264_DPB_ENTRY_FLAG_ACTIVE;
+        controls->dpb_pictures[entries] = h->mvc_base;
+        /* Inter-view eligibility is independent of temporal marking. */
+        fill_dpb_entry(&decode_params->dpb[entries], h->mvc_base,
+                       h->mvc_base->pic_id, fields);
     }
     return 0;
 }
 
-static void fill_ref_list(struct v4l2_h264_reference *reference,
-                          struct v4l2_ctrl_h264_decode_params *decode_params,
-                          const H264Ref *ref)
+static int fill_ref_list(struct v4l2_h264_reference *reference,
+                         const V4L2RequestControlsH264 *controls,
+                         const H264Ref *ref)
 {
+    const unsigned int required = V4L2_H264_DPB_ENTRY_FLAG_VALID |
+                                  V4L2_H264_DPB_ENTRY_FLAG_ACTIVE;
+    unsigned int fields = ref->reference & V4L2_H264_FRAME_REF;
     uint64_t timestamp;
 
-    if (!ref->parent)
-        return;
+    if (!fields || (ref->reference & ~(V4L2_H264_FRAME_REF | DELAYED_PIC_REF)) ||
+        (reference_fields(ref->parent) & fields) != fields)
+        return AVERROR_INVALIDDATA;
 
     timestamp = ff_v4l2_request_get_capture_timestamp(ref->parent->f);
+    if (!timestamp)
+        return AVERROR_INVALIDDATA;
 
-    for (uint8_t i = 0; i < FF_ARRAY_ELEMS(decode_params->dpb); i++) {
-        struct v4l2_h264_dpb_entry *entry = &decode_params->dpb[i];
-        if ((entry->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID) &&
-            entry->reference_ts == timestamp) {
-            reference->fields = ref->reference & V4L2_H264_FRAME_REF;
-            reference->index = i;
-            return;
+    for (uint8_t i = 0; i < FF_ARRAY_ELEMS(controls->decode_params.dpb); i++) {
+        const struct v4l2_h264_dpb_entry *entry = &controls->decode_params.dpb[i];
+        const H264Picture *pic = controls->dpb_pictures[i];
+        if (pic && pic->hwaccel_picture_private == ref->parent->hwaccel_picture_private &&
+            v4l2_request_framedesc(pic->f) == v4l2_request_framedesc(ref->parent->f) &&
+            (entry->flags & required) == required &&
+            entry->reference_ts == timestamp &&
+            (entry->fields & fields) == fields) {
+            *reference = (struct v4l2_h264_reference) { .fields = fields, .index = i };
+            return 0;
         }
     }
+    return AVERROR_INVALIDDATA;
+}
+
+static int fill_slice_references(AVCodecContext *avctx,
+                                 const V4L2RequestControlsH264 *controls,
+                                 struct v4l2_ctrl_h264_slice_params *slice,
+                                 const H264SliceContext *sl)
+{
+    struct v4l2_h264_reference *lists[] = {
+        slice->ref_pic_list0, slice->ref_pic_list1,
+    };
+
+    if (sl->list_count > FF_ARRAY_ELEMS(lists))
+        return AVERROR_INVALIDDATA;
+    for (int list = 0; list < sl->list_count; list++) {
+        if (sl->ref_count[list] <= 0 ||
+            sl->ref_count[list] > FF_ARRAY_ELEMS(slice->ref_pic_list0))
+            return AVERROR_INVALIDDATA;
+        for (int i = 0; i < sl->ref_count[list]; i++) {
+            int ret = fill_ref_list(&lists[list][i], controls, &sl->ref_list[list][i]);
+            if (ret < 0) {
+                const H264Picture *pic = sl->ref_list[list][i].parent;
+                av_log(avctx, AV_LOG_ERROR,
+                       "H264 reference L%d[%d] has no reconstructed compatible DPB field "
+                       "(frame_num=%d, selected=%u, available=%u)\n",
+                       list, i, pic ? pic->frame_num : -1,
+                       sl->ref_list[list][i].reference, reference_fields(pic));
+                return ret;
+            }
+        }
+    }
+    return 0;
+}
+
+static int v4l2_request_h264_fail_frame(AVCodecContext *avctx, int error,
+                                        bool queue_failed)
+{
+    const H264Context *h = avctx->priv_data;
+    V4L2RequestContextH264 *ctx = avctx->internal->hwaccel_priv_data;
+    V4L2RequestControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
+    int ret;
+
+    if (!controls->error)
+        controls->error = error;
+    controls->started = false;
+    controls->submitted_fields = 0;
+    ret = ff_v4l2_request_abort_frame(avctx, &controls->pic, h->cur_pic_ptr->f,
+                                     controls->held, queue_failed);
+    controls->held = false;
+    if (ret < 0)
+        ctx->error = ret;
+    return controls->error;
 }
 
 static void fill_sps(struct v4l2_ctrl_h264_sps *ctrl, const H264Context *h)
@@ -251,12 +356,21 @@ static int v4l2_request_h264_start_frame(AVCodecContext *avctx,
     const PPS *pps = h->ps.pps;
     const SPS *sps = h->ps.sps;
     const H264SliceContext *sl = &h->slice_ctx[0];
+    V4L2RequestContextH264 *ctx = avctx->internal->hwaccel_priv_data;
     V4L2RequestControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
     int ret;
 
-    ret = ff_v4l2_request_start_frame(avctx, &controls->pic, h->cur_pic_ptr->f);
-    if (ret)
-        return ret;
+    if (controls->started || controls->held)
+        return v4l2_request_h264_fail_frame(avctx, AVERROR_INVALIDDATA, false);
+
+    controls->started = false;
+    controls->held = false;
+    controls->first_slice = true;
+    controls->num_slices = 0;
+    if (ctx->error || controls->error)
+        return v4l2_request_h264_fail_frame(avctx,
+                                           ctx->error ? ctx->error : controls->error,
+                                           false);
 
     fill_sps(&controls->sps, h);
     fill_pps(&controls->pps, h);
@@ -317,12 +431,21 @@ static int v4l2_request_h264_start_frame(AVCodecContext *avctx,
         controls->decode_params.flags |= V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
 #endif
 
-    ret = fill_dpb(&controls->decode_params, h);
+    ret = fill_dpb(controls, h);
     if (ret < 0)
-        return ret;
+        return v4l2_request_h264_fail_frame(avctx, ret, false);
 
-    controls->first_slice = true;
-    controls->num_slices = 0;
+    /* A leading open-GOP field can select an FFmpeg gap placeholder. Reject
+     * it before acquiring OUTPUT or publishing a successful capture callback. */
+    controls->slice_params = (struct v4l2_ctrl_h264_slice_params) { 0 };
+    ret = fill_slice_references(avctx, controls, &controls->slice_params, sl);
+    if (ret < 0)
+        return v4l2_request_h264_fail_frame(avctx, ret, false);
+
+    ret = ff_v4l2_request_start_frame(avctx, &controls->pic, h->cur_pic_ptr->f);
+    if (ret < 0)
+        return v4l2_request_h264_fail_frame(avctx, ret, false);
+    controls->started = true;
 
     return 0;
 }
@@ -332,6 +455,7 @@ static int v4l2_request_h264_queue_decode(AVCodecContext *avctx, bool last_slice
     const H264Context *h = avctx->priv_data;
     V4L2RequestContextH264 *ctx = avctx->internal->hwaccel_priv_data;
     V4L2RequestControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
+    int ret;
 
     struct v4l2_ext_control control[] = {
         {
@@ -368,12 +492,18 @@ static int v4l2_request_h264_queue_decode(AVCodecContext *avctx, bool last_slice
 
     if (ctx->decode_mode == V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED) {
         int count = FF_ARRAY_ELEMS(control) - (controls->pred_weights_required ? 0 : 1);
-        return ff_v4l2_request_decode_slice(avctx, &controls->pic, control, count,
-                                            controls->first_slice, last_slice);
+        ret = ff_v4l2_request_decode_slice(avctx, &controls->pic, control, count,
+                                          controls->first_slice, last_slice);
+    } else {
+        ret = ff_v4l2_request_decode_frame(avctx, &controls->pic,
+                                          control, FF_ARRAY_ELEMS(control) - 2);
     }
+    if (ret < 0)
+        return v4l2_request_h264_fail_frame(avctx, ret, true);
 
-    return ff_v4l2_request_decode_frame(avctx, &controls->pic,
-                                        control, FF_ARRAY_ELEMS(control) - 2);
+    controls->held = !last_slice &&
+        (controls->pic.output->capabilities & V4L2_BUF_CAP_SUPPORTS_M2M_HOLD_CAPTURE_BUF);
+    return 0;
 }
 
 static int v4l2_request_h264_decode_slice(AVCodecContext *avctx,
@@ -384,50 +514,10 @@ static int v4l2_request_h264_decode_slice(AVCodecContext *avctx,
     const H264SliceContext *sl = &h->slice_ctx[0];
     V4L2RequestContextH264 *ctx = avctx->internal->hwaccel_priv_data;
     V4L2RequestControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
-    int i, ret, count;
-
-    if (ctx->decode_mode == V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED &&
-        controls->num_slices) {
-        ret = v4l2_request_h264_queue_decode(avctx, false);
-        if (ret)
-            return ret;
-
-        ff_v4l2_request_reset_picture(avctx, &controls->pic);
-        controls->first_slice = 0;
-    }
-
-    if (h->mvc_sps && controls->first_slice && h->mvc_subsps) {
-        /* Parameter NAL plus the actual type-20/base slice, both Annex B.
-         * header_bit_size below remains relative to the slice NAL. */
-        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
-                                           nalu_slice_start_code, 3);
-        if (ret)
-            return ret;
-        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
-                                           h->mvc_subsps->data, h->mvc_subsps->size);
-        if (ret)
-            return ret;
-    }
-    if (ctx->start_code == V4L2_STATELESS_H264_START_CODE_ANNEX_B) {
-        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
-                                            nalu_slice_start_code, 3);
-        if (ret)
-            return ret;
-    }
-
-    ret = ff_v4l2_request_append_output(avctx, &controls->pic, buffer, size);
-    if (ret)
-        return ret;
-
-    if (ctx->decode_mode != V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED)
-        return 0;
-
-    controls->slice_params = (struct v4l2_ctrl_h264_slice_params) {
+    struct v4l2_ctrl_h264_slice_params slice = {
         /* Offset in bits to slice_data() from the beginning of this slice. */
         .header_bit_size = get_bits_count(&sl->gb),
-
         .first_mb_in_slice = sl->first_mb_addr,
-
         .slice_type = ff_h264_get_slice_type(sl),
         .colour_plane_id = 0, /* separate colour plane not supported by FFmpeg */
         .redundant_pic_cnt = sl->redundant_pic_count,
@@ -442,40 +532,94 @@ static int v4l2_request_h264_decode_slice(AVCodecContext *avctx,
         .num_ref_idx_l0_active_minus1 = sl->list_count > 0 ? sl->ref_count[0] - 1 : 0,
         .num_ref_idx_l1_active_minus1 = sl->list_count > 1 ? sl->ref_count[1] - 1 : 0,
     };
+    int ret;
+
+    if (controls->error)
+        return controls->error;
+    if (!controls->started)
+        return v4l2_request_h264_fail_frame(avctx, AVERROR_INVALIDDATA, false);
+
+    /* Validate the new slice without replacing the pending slice's controls.
+     * Only then may the preceding slice be submitted with HOLD. */
+    ret = fill_slice_references(avctx, controls, &slice, sl);
+    if (ret < 0)
+        goto fail;
+
+    if (ctx->decode_mode == V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED &&
+        controls->num_slices) {
+        ret = v4l2_request_h264_queue_decode(avctx, false);
+        if (ret < 0)
+            return ret;
+
+        ret = ff_v4l2_request_reset_picture(avctx, &controls->pic);
+        if (ret < 0)
+            goto fail;
+        controls->first_slice = false;
+    }
+
+    if (h->mvc_sps && controls->first_slice && h->mvc_subsps) {
+        /* Parameter NAL plus the actual type-20/base slice, both Annex B.
+         * header_bit_size above remains relative to the slice NAL. */
+        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
+                                           nalu_slice_start_code, 3);
+        if (ret < 0)
+            goto fail;
+        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
+                                           h->mvc_subsps->data, h->mvc_subsps->size);
+        if (ret < 0)
+            goto fail;
+    }
+    if (ctx->start_code == V4L2_STATELESS_H264_START_CODE_ANNEX_B) {
+        ret = ff_v4l2_request_append_output(avctx, &controls->pic,
+                                            nalu_slice_start_code, 3);
+        if (ret < 0)
+            goto fail;
+    }
+
+    ret = ff_v4l2_request_append_output(avctx, &controls->pic, buffer, size);
+    if (ret < 0)
+        goto fail;
+
+    controls->num_slices++;
+    if (ctx->decode_mode != V4L2_STATELESS_H264_DECODE_MODE_SLICE_BASED)
+        return 0;
 
     if (sl->slice_type == AV_PICTURE_TYPE_B && sl->direct_spatial_mv_pred)
-        controls->slice_params.flags |= V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED;
+        slice.flags |= V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED;
 
     /* V4L2_H264_SLICE_FLAG_SP_FOR_SWITCH: not implemented by FFmpeg */
-
+    controls->slice_params = slice;
     controls->pred_weights_required =
-        V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(&controls->pps, &controls->slice_params);
+        V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(&controls->pps, &slice);
     if (controls->pred_weights_required) {
         controls->pred_weights.chroma_log2_weight_denom = sl->pwt.chroma_log2_weight_denom;
         controls->pred_weights.luma_log2_weight_denom = sl->pwt.luma_log2_weight_denom;
+        for (int list = 0; list < sl->list_count; list++)
+            fill_weight_factors(&controls->pred_weights.weight_factors[list], list, sl);
     }
 
-    count = sl->list_count > 0 ? sl->ref_count[0] : 0;
-    for (i = 0; i < count; i++)
-        fill_ref_list(&controls->slice_params.ref_pic_list0[i],
-                      &controls->decode_params, &sl->ref_list[0][i]);
-    if (count && controls->pred_weights_required)
-        fill_weight_factors(&controls->pred_weights.weight_factors[0], 0, sl);
-
-    count = sl->list_count > 1 ? sl->ref_count[1] : 0;
-    for (i = 0; i < count; i++)
-        fill_ref_list(&controls->slice_params.ref_pic_list1[i],
-                      &controls->decode_params, &sl->ref_list[1][i]);
-    if (count && controls->pred_weights_required)
-        fill_weight_factors(&controls->pred_weights.weight_factors[1], 1, sl);
-
-    controls->num_slices++;
     return 0;
+fail:
+    return v4l2_request_h264_fail_frame(avctx, ret, false);
 }
 
 static int v4l2_request_h264_end_frame(AVCodecContext *avctx)
 {
-    return v4l2_request_h264_queue_decode(avctx, true);
+    const H264Context *h = avctx->priv_data;
+    V4L2RequestControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
+    int ret;
+
+    if (controls->error)
+        return controls->error;
+    if (!controls->started || !controls->num_slices)
+        return v4l2_request_h264_fail_frame(avctx, AVERROR_INVALIDDATA, false);
+
+    ret = v4l2_request_h264_queue_decode(avctx, true);
+    if (ret < 0)
+        return ret;
+    controls->submitted_fields |= h->picture_structure;
+    controls->started = false;
+    return 0;
 }
 
 static int v4l2_request_h264_post_probe(AVCodecContext *avctx)

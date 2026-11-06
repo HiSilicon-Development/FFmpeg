@@ -10,6 +10,7 @@ version 9.0.1:
  avcodec/v4l2_request: prefer advertised CV200 HT10 for proven progressive uncropped Main10, preserving linear compatibility paths
  avutil/v4l2request: export explicit native tiled DRM surfaces with coded geometry and read-only bit-exact P010 transfers/maps
  avcodec/h264: finish parsed field POC/MMCO state after hardware start rejection without submitting an unstarted picture
+ avcodec/v4l2_request_h264: preflight reconstructed reference fields, retain complementary-field identity and fail unavailable open-GOP references explicitly
  avcodec/v4l2_request: invalidate aborted pictures and retire held H264 aggregates with quiescent stateless FLUSH; fail closed after uncertain queue errors
  Bump for 9.0.1
  avcodec/lcldec: clear what the multithread chunks leave undecoded
